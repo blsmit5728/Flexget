@@ -293,14 +293,18 @@ class ApiTmdb(object):
         if not movie.id:
             raise LookupError('Cannot get tmdb details without tmdb id')
         result = get_first_result('getInfo', movie.id)
+        #print "Result from getInfo= " + result.get('posters')
         if result:
+            print "Got result"
             movie.update_from_dict(result)
-            posters = result.get('posters')
+            posters = result.get('poster_path')
+            print posters
             if posters:
                 # Add any posters we don't already have
                 # TODO: There are quite a few posters per movie, do we need to cache them all?
                 poster_urls = [p.url for p in movie.posters]
                 for item in posters:
+				#https://api.themoviedb.org/3/movie/8681/images?api_key=f364752b279d93d918ea567896cb1485
                     if item.get('image') and item['image']['url'] not in poster_urls:
                         movie.posters.append(TMDBPoster(item['image']))
             genres = result.get('genres')
@@ -323,28 +327,28 @@ def get_first_result(tmdb_function, value):
         value = value.encode('utf-8')
     if isinstance(value, basestring):
         value = quote(value, safe=b'')
-    print tmdb_function
+    print "TMDB_FUNCT" + tmdb_function
     if tmdb_function == 'imdbLookup':
     	url = '%s/3/movie/%s?&api_key=%s' % (server, value, api_key)
     elif tmdb_function == 'search':
     	url = '%s/3/search/movie?query=%s&api_key=%s&page=1' % (server, value, api_key)
+    elif tmdb_function == 'getInfo':
+        url = '%s/3/movie/%s?&api_key=%s' % (server, value, api_key)
+        print url
+    else:
+        print value
     try:
         data = requests.get(url)
     except requests.RequestException:
         log.warning('Request failed %s' % url)
         return
     try:
-        #result = data.json()
-        #print data
         result = data.json()
-        print result.get('id')
     except ValueError:
         log.warning('TMDb returned invalid json.')
         return
     # Make sure there is a valid result to return
-    if len(result):
-        result = result[0]
-        if isinstance(result, dict) and result.get('id'):
+    if len(result) and result.get('id'):
             return result
 
 register_plugin(ApiTmdb, 'api_tmdb')
