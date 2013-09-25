@@ -13,17 +13,24 @@ from flexget import db_schema
 from flexget.utils.sqlalchemy_utils import table_add_column, table_schema
 from flexget.utils.titles import MovieParser
 from flexget.utils import requests
+from flexget.utils import json
 from flexget.utils.database import text_date_synonym, year_property, with_session
 from flexget.manager import Session
 from flexget.plugin import register_plugin
+
+try:
+    import simplejson as myjson
+except:
+    import json as simplejson
 
 log = logging.getLogger('api_tmdb')
 Base = db_schema.versioned_base('api_tmdb', 0)
 
 # This is a FlexGet API key
-api_key = 'bdfc018dbdb7c243dc7cb1454ff74b95'
+#api_key = 'bdfc018dbdb7c243dc7cb1454ff74b95'
+api_key = 'f364752b279d93d918ea567896cb1485'
 lang = 'en'
-server = 'http://api.themoviedb.org'
+server = 'https://api.themoviedb.org'
 
 
 @db_schema.upgrade('api_tmdb')
@@ -242,6 +249,7 @@ class ApiTmdb(object):
             try:
                 if imdb_id and not tmdb_id:
                     result = get_first_result('imdbLookup', imdb_id)
+                    print "From get: " % result
                     if result:
                         movie = session.query(TMDBMovie).filter(TMDBMovie.id == result['id']).first()
                         if movie:
@@ -315,19 +323,26 @@ def get_first_result(tmdb_function, value):
         value = value.encode('utf-8')
     if isinstance(value, basestring):
         value = quote(value, safe=b'')
-    url = '%s/2.1/Movie.%s/%s/json/%s/%s' % (server, tmdb_function, lang, api_key, value)
+    print tmdb_function
+    if tmdb_function == 'imdbLookup':
+    	url = '%s/3/movie/%s?&api_key=%s' % (server, value, api_key)
+    elif tmdb_function == 'search':
+    	url = '%s/3/search/movie?query=%s&api_key=%s&page=1' % (server, value, api_key)
     try:
         data = requests.get(url)
     except requests.RequestException:
         log.warning('Request failed %s' % url)
         return
     try:
+        #result = data.json()
+        #print data
         result = data.json()
+        print result.get('id')
     except ValueError:
         log.warning('TMDb returned invalid json.')
         return
     # Make sure there is a valid result to return
-    if isinstance(result, list) and len(result):
+    if len(result):
         result = result[0]
         if isinstance(result, dict) and result.get('id'):
             return result
