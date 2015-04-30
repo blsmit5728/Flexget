@@ -1,11 +1,11 @@
 from __future__ import unicode_literals, division, absolute_import
-from tests import FlexGetBase
+from tests import FlexGetBase, build_parser_function
 
 
 class TestRegexp(FlexGetBase):
 
     __yaml__ = """
-        presets:
+        templates:
           global:
             mock:
               - {title: 'regexp1', 'imdb_score': 5}

@@ -1,14 +1,14 @@
 from __future__ import unicode_literals, division, absolute_import
-from nose.plugins.attrib import attr
+
 from flexget.manager import Session
 from flexget.plugins.api_tvdb import lookup_episode
-from tests import FlexGetBase
+from tests import FlexGetBase, use_vcr
 
 
 class TestThetvdbLookup(FlexGetBase):
 
     __yaml__ = """
-        presets:
+        templates:
           global:
             thetvdb_lookup: yes
             # Access a tvdb field to cause lazy loading to occur
@@ -32,7 +32,7 @@ class TestThetvdbLookup(FlexGetBase):
               - {title: 'House.S02E02.hdtv'}
             metainfo_series: yes
             accept_all: yes
-            disable_builtins: [seen]
+            disable: [seen]
           test_date:
             mock:
               - title: the daily show 2012-6-6
@@ -46,21 +46,21 @@ class TestThetvdbLookup(FlexGetBase):
 
     """
 
-    @attr(online=True)
+    @use_vcr
     def test_lookup(self):
         """thetvdb: Test Lookup (ONLINE)"""
         self.execute_task('test')
         entry = self.task.find_entry(title='House.S01E02.HDTV.XViD-FlexGet')
         assert entry['tvdb_ep_name'] == 'Paternity', \
             '%s tvdb_ep_name should be Paternity' % entry['title']
-        assert int(entry['tvdb_runtime']) == 60, \
-            'runtime for %s is %s, should be 60' % (entry['title'], entry['tvdb_runtime'])
-        assert entry['tvdb_genres'] == ['Comedy', 'Drama']
+        assert entry['tvdb_status'] == 'Ended', \
+            'runtime for %s is %s, should be Ended' % (entry['title'], entry['tvdb_status'])
+        assert entry['tvdb_absolute_number'] == 3
         assert entry['afield'] == '73255Paternity', 'afield was not set correctly'
         assert self.task.find_entry(tvdb_ep_name='School Reunion'), \
             'Failed imdb lookup Doctor Who 2005 S02E03'
 
-    @attr(online=True)
+    @use_vcr
     def test_unknown_series(self):
         # Test an unknown series does not cause any exceptions
         self.execute_task('test_unknown_series')
@@ -68,7 +68,7 @@ class TestThetvdbLookup(FlexGetBase):
         entry = self.task.find_entry('accepted', title='Aoeu.Htns.S01E01.htvd')
         assert entry.get('tvdb_id') is None, 'should not have populated tvdb data'
 
-    @attr(online=True)
+    @use_vcr
     def test_mark_expired(self):
 
         def test_run():
@@ -90,14 +90,14 @@ class TestThetvdbLookup(FlexGetBase):
         session.close()
         test_run()
 
-    @attr(online=True)
+    @use_vcr
     def test_date(self):
         self.execute_task('test_date')
         entry = self.task.find_entry(title='the daily show 2012-6-6')
         assert entry
         assert entry['tvdb_ep_name'] == 'Michael Fassbender'
 
-    @attr(online=True)
+    @use_vcr
     def test_absolute(self):
         self.execute_task('test_absolute')
         entry = self.task.find_entry(title='naruto 128')
@@ -123,7 +123,7 @@ class TestThetvdbFavorites(FlexGetBase):
               - {title: 'Doctor.Who.2005.S02E03.PDTV.XViD-FlexGet'}
               - {title: 'Lost.S03E02.720p-FlexGet'}
               - {title: 'Penn.and.Teller.Bullshit.S02E02.720p.x264'}
-            import_series:
+            configure_series:
               from:
                 thetvdb_favorites:
                   account_id: 80FB8BD0720CA5EC
@@ -133,7 +133,7 @@ class TestThetvdbFavorites(FlexGetBase):
               strip_dates: yes
     """
 
-    @attr(online=True)
+    @use_vcr
     def test_favorites(self):
         """thetvdb: Test favorites (ONLINE)"""
         self.execute_task('test')
@@ -148,7 +148,7 @@ class TestThetvdbFavorites(FlexGetBase):
         assert entry not in self.task.accepted, \
             'series Lost should not have been accepted'
 
-    @attr(online=True)
+    @use_vcr
     def test_strip_date(self):
         self.execute_task('test_strip_dates')
         assert self.task.find_entry(title='Hawaii Five-0'), \

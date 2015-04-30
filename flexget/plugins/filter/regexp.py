@@ -3,9 +3,10 @@ import urllib
 import logging
 import re
 
+from flexget import plugin
 from flexget.config_schema import one_or_more
 from flexget.entry import Entry
-from flexget.plugin import register_plugin, priority, get_plugin_by_name
+from flexget.event import event
 
 log = logging.getLogger('regexp')
 
@@ -111,6 +112,9 @@ class FilterRegexp(object):
                 # Parse custom settings for this regexp
                 if not isinstance(opts, dict):
                     opts = {'path': opts}
+                else:
+                    # We don't want to modify original config
+                    opts = opts.copy()
                 # advanced configuration
                 if config.get('from'):
                     opts.setdefault('from', config['from'])
@@ -122,15 +126,19 @@ class FilterRegexp(object):
 
                 # compile `not` option regexps
                 if 'not' in opts:
-                    for idx, not_re in enumerate(opts['not'][:]):
-                        opts['not'][idx] = re.compile(not_re, re.IGNORECASE | re.UNICODE)
+                    opts['not'] = [re.compile(not_re, re.IGNORECASE | re.UNICODE) for not_re in opts['not']]
 
                 # compile regexp and make sure regexp is a string for series like '24'
-                regexp = re.compile(unicode(regexp), re.IGNORECASE | re.UNICODE)
+                try:
+                    regexp = re.compile(unicode(regexp), re.IGNORECASE | re.UNICODE)
+                except re.error as e:
+                    # Since validator can't validate dict keys (when an option is defined for the pattern) make sure we
+                    # raise a proper error here.
+                    raise plugin.PluginError('Invalid regex `%s`: %s' % (regexp, e))
                 out_config.setdefault(operation, []).append({regexp: opts})
         return out_config
 
-    @priority(172)
+    @plugin.priority(172)
     def on_task_filter(self, task, config):
         # TODO: what if accept and accept_excluding configured? Should raise error ...
         config = self.prepare_config(config)
@@ -217,7 +225,7 @@ class FilterRegexp(object):
                     if opts.get('set'):
                         # invoke set plugin with given configuration
                         log.debug('adding set: info to entry:"%s" %s' % (entry['title'], opts['set']))
-                        set = get_plugin_by_name('set')
+                        set = plugin.get_plugin_by_name('set')
                         set.instance.modify(entry, opts['set'])
                     method(entry, matchtext)
                     # We had a match so break out of the regexp loop.
@@ -228,4 +236,6 @@ class FilterRegexp(object):
                 rest.append(entry)
         return rest
 
-register_plugin(FilterRegexp, 'regexp', api_ver=2)
+@event('plugin.register')
+def register_plugin():
+    plugin.register(FilterRegexp, 'regexp', api_ver=2)

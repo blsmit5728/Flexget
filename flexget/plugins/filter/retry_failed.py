@@ -1,15 +1,18 @@
 from __future__ import unicode_literals, division, absolute_import
 import logging
 from datetime import datetime, timedelta
-from sqlalchemy import Column, Integer, String, Unicode, DateTime
-from sqlalchemy.schema import Index, MetaData
-from flexget import db_schema
-from flexget.plugin import register_plugin, register_parser_option, priority, DependencyError, get_plugin_by_name
-from flexget.manager import Session
-from flexget.utils.tools import console, parse_timedelta
-from flexget.utils.sqlalchemy_utils import table_add_column
 
-SCHEMA_VER = 2
+from sqlalchemy import Column, Integer, String, Unicode, DateTime
+from sqlalchemy.schema import Index
+
+from flexget import db_schema, options, plugin
+from flexget.event import event
+from flexget.logger import console
+from flexget.manager import Session
+from flexget.utils.tools import parse_timedelta
+from flexget.utils.sqlalchemy_utils import table_add_column, table_schema
+
+SCHEMA_VER = 3
 
 log = logging.getLogger('failed')
 Base = db_schema.versioned_base('failed', SCHEMA_VER)
@@ -24,13 +27,15 @@ def upgrade(ver, session):
     if ver == 0:
         # define an index
         log.info('Adding database index ...')
-        meta = MetaData(bind=session.connection(), reflect=True)
-        failed = meta.tables['failed']
+        failed = table_schema('failed', session)
         Index('failed_title_url', failed.c.title, failed.c.url, failed.c.count).create()
         ver = 1
     if ver == 1:
         table_add_column('failed', 'reason', Unicode, session)
         ver = 2
+    if ver == 2:
+        table_add_column('failed', 'retry_time', DateTime, session)
+        ver = 3
     return ver
 
 
@@ -43,6 +48,7 @@ class FailedEntry(Base):
     tof = Column(DateTime)
     reason = Column(Unicode)
     count = Column(Integer, default=1)
+    retry_time = Column(DateTime)
 
     def __init__(self, title, url, reason=None):
         self.title = title
@@ -59,84 +65,11 @@ Index('failed_title_url', columns.title, columns.url, columns.count)
 
 
 class PluginFailed(object):
-    """Provides tracking for failures and related commandline utilities."""
+    """
+    Records entry failures and stores them for trying again after a certain interval.
+    Rejects them after they have failed too many times.
 
-    def on_process_start(self, task, config):
-        if task.manager.options.failed:
-            task.manager.disable_tasks()
-            self.print_failed()
-            return
-        if task.manager.options.clear_failed:
-            task.manager.disable_tasks()
-            if self.clear_failed():
-                task.manager.config_changed()
-            return
-
-    @priority(-255)
-    def on_task_input(self, task, config):
-        for entry in task.all_entries:
-            entry.on_fail(self.add_failed)
-
-    def print_failed(self):
-        """Parameter --failed"""
-
-        failed = Session()
-        try:
-            results = failed.query(FailedEntry).all()
-            if not results:
-                console('No failed entries recorded')
-            for entry in results:
-                console('%16s - %s - %s times - %s' %
-                        (entry.tof.strftime('%Y-%m-%d %H:%M'), entry.title, entry.count, entry.reason))
-        finally:
-            failed.close()
-
-    def add_failed(self, entry, reason=None, **kwargs):
-        """Adds entry to internal failed list, displayed with --failed"""
-        reason = reason or 'Unknown'
-        failed = Session()
-        try:
-            # query item's existence
-            item = failed.query(FailedEntry).filter(FailedEntry.title == entry['title']).\
-                filter(FailedEntry.url == entry['original_url']).first()
-            if not item:
-                item = FailedEntry(entry['title'], entry['original_url'], reason)
-            else:
-                item.count += 1
-                item.tof = datetime.now()
-                item.reason = reason
-            failed.merge(item)
-            log.debug('Marking %s in failed list. Has failed %s times.' % (item.title, item.count))
-
-            # limit item number to 25
-            for row in failed.query(FailedEntry).order_by(FailedEntry.tof.desc())[25:]:
-                failed.delete(row)
-            failed.commit()
-        finally:
-            failed.close()
-
-    def clear_failed(self):
-        """
-        Clears list of failed entries
-
-        :return: The number of entries cleared.
-        """
-        session = Session()
-        try:
-            results = session.query(FailedEntry).delete()
-            console('Cleared %i items.' % results)
-            session.commit()
-            return results
-        finally:
-            session.close()
-
-
-class FilterRetryFailed(object):
-    """Stores failed entries for trying again after a certain interval,
-    rejects them after they have failed too many times."""
-
-    def __init__(self):
-        self.backlog = None
+    """
 
     schema = {
         "oneOf": [
@@ -158,6 +91,12 @@ class FilterRetryFailed(object):
         ]
     }
 
+    def __init__(self):
+        try:
+            self.backlog = plugin.get_plugin_by_name('backlog')
+        except plugin.DependencyError:
+            log.warning('Unable utilize backlog plugin, failed entries may not be retried properly.')
+
     def prepare_config(self, config):
         if not isinstance(config, dict):
             config = {}
@@ -171,13 +110,47 @@ class FilterRetryFailed(object):
             config['retry_time_multiplier'] = 1
         return config
 
-    def on_process_start(self, task, config):
-        try:
-            self.backlog = get_plugin_by_name('backlog').instance
-        except DependencyError:
-            log.warning('Unable utilize backlog plugin, failed entries may not be retried properly.')
+    def retry_time(self, fail_count, config):
+        """Return the timedelta an entry that has failed `fail_count` times before should wait before being retried."""
+        base_retry_time = parse_timedelta(config['retry_time'])
+        # Timedeltas do not allow floating point multiplication. Convert to seconds and then back to avoid this.
+        base_retry_secs = base_retry_time.days * 86400 + base_retry_time.seconds
+        retry_secs = base_retry_secs * (config['retry_time_multiplier'] ** fail_count)
+        return timedelta(seconds=retry_secs)
 
-    @priority(255)
+    @plugin.priority(-255)
+    def on_task_input(self, task, config):
+        if config is False:
+            return
+        config = self.prepare_config(config)
+        for entry in task.all_entries:
+            entry.on_fail(self.add_failed, config=config)
+
+    def add_failed(self, entry, reason=None, config=None, **kwargs):
+        """Adds entry to internal failed list, displayed with --failed"""
+        reason = reason or 'Unknown'
+        with Session() as session:
+            # query item's existence
+            item = session.query(FailedEntry).filter(FailedEntry.title == entry['title']).\
+                filter(FailedEntry.url == entry['original_url']).first()
+            if not item:
+                item = FailedEntry(entry['title'], entry['original_url'], reason)
+                item.count = 0
+            retry_time = self.retry_time(item.count, config)
+            item.retry_time = datetime.now() + retry_time
+            item.count += 1
+            item.tof = datetime.now()
+            item.reason = reason
+            session.merge(item)
+            log.debug('Marking %s in failed list. Has failed %s times.' % (item.title, item.count))
+            if self.backlog and item.count <= config['max_retries']:
+                self.backlog.instance.add_backlog(entry.task, entry, amount=retry_time, session=session)
+            entry.task.rerun()
+            # limit item number to 25
+            for row in session.query(FailedEntry).order_by(FailedEntry.tof.desc())[25:]:
+                session.delete(row)
+
+    @plugin.priority(255)
     def on_task_filter(self, task, config):
         if config is False:
             return
@@ -185,44 +158,55 @@ class FilterRetryFailed(object):
         max_count = config['max_retries']
         for entry in task.entries:
             item = task.session.query(FailedEntry).filter(FailedEntry.title == entry['title']).\
-                filter(FailedEntry.url == entry['original_url']).\
-                filter(FailedEntry.count > max_count).first()
-            if item:
-                entry.reject('Has already failed %s times in the past' % item.count)
-
-    def on_task_exit(self, task, config):
-        if config is False:
-            return
-        config = self.prepare_config(config)
-        base_retry_time = parse_timedelta(config['retry_time'])
-        retry_time_multiplier = config['retry_time_multiplier']
-        for entry in task.failed:
-            item = task.session.query(FailedEntry).filter(FailedEntry.title == entry['title']).\
                 filter(FailedEntry.url == entry['original_url']).first()
             if item:
-                # Do not count the failure on this run when adding additional retry time
-                fail_count = item.count - 1
-                # Don't bother saving this if it has met max retries
-                if fail_count >= config['max_retries']:
-                    continue
-                # Timedeltas do not allow floating point multiplication. Convert to seconds and then back to avoid this.
-                base_retry_secs = base_retry_time.days * 86400 + base_retry_time.seconds
-                retry_secs = base_retry_secs * (retry_time_multiplier ** fail_count)
-                retry_time = timedelta(seconds=retry_secs)
-            else:
-                retry_time = base_retry_time
-            if self.backlog:
-                self.backlog.add_backlog(task, entry, amount=retry_time)
-            if retry_time:
-                fail_reason = item.reason if item else entry.get('reason', 'unknown')
-                entry.reject(reason='Waiting before trying failed entry again. (failure reason: %s)' %
-                    fail_reason, remember_time=retry_time)
-                # Cause a task rerun, to look for alternate releases
-                task.rerun()
+                if item.count > max_count:
+                    entry.reject('Has already failed %s times in the past. (failure reason: %s)' %
+                                 (item.count, item.reason))
+                elif item.retry_time and item.retry_time > datetime.now():
+                    entry.reject('Waiting before retrying entry which has failed in the past. (failure reason: %s)' %
+                                 item.reason)
 
-register_plugin(PluginFailed, '--failed', builtin=True, api_ver=2)
-register_plugin(FilterRetryFailed, 'retry_failed', builtin=True, api_ver=2)
-register_parser_option('--failed', action='store_true', dest='failed', default=0,
-                       help='List recently failed entries.')
-register_parser_option('--clear', action='store_true', dest='clear_failed', default=0,
-                       help='Clear recently failed list.')
+
+def do_cli(manager, options):
+    if options.failed_action == 'list':
+        list_failed()
+    elif options.failed_action == 'clear':
+        clear_failed(manager)
+
+
+def list_failed():
+    session = Session()
+    try:
+        results = session.query(FailedEntry).all()
+        if not results:
+            console('No failed entries recorded')
+        for entry in results:
+            console('%16s - %s - %s times - %s' %
+                    (entry.tof.strftime('%Y-%m-%d %H:%M'), entry.title, entry.count, entry.reason))
+    finally:
+        session.close()
+
+
+def clear_failed(manager):
+    session = Session()
+    try:
+        results = session.query(FailedEntry).delete()
+        console('Cleared %i items.' % results)
+        session.commit()
+        if results:
+            manager.config_changed()
+    finally:
+        session.close()
+
+
+@event('plugin.register')
+def register_plugin():
+    plugin.register(PluginFailed, 'retry_failed', builtin=True, api_ver=2)
+
+@event('options.register')
+def register_parser_arguments():
+    parser = options.register_command('failed', do_cli, help='list or clear remembered failures')
+    subparsers = parser.add_subparsers(dest='failed_action', metavar='<action>')
+    subparsers.add_parser('list', help='list all the entries that have had failures')
+    subparsers.add_parser('clear', help='clear all failures from database, so they can be retried')

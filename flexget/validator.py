@@ -1,7 +1,9 @@
-from __future__ import unicode_literals, division, absolute_import
+from __future__ import absolute_import, division, print_function, unicode_literals
+
 import re
 
 from flexget.config_schema import process_config
+
 
 # TODO: rename all validator.valid -> validator.accepts / accepted / accept ?
 
@@ -589,7 +591,7 @@ if __name__ == '__main__':
 
     import json
 
-    print json.dumps(schema, sort_keys=True, indent=4)
+    print(json.dumps(schema, sort_keys=True, indent=4))
 
     """
     root = factory()

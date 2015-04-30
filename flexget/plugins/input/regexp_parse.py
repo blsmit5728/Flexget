@@ -1,10 +1,13 @@
 from __future__ import unicode_literals, division, absolute_import
+import codecs
 import re
 import logging
 import os
+
+from flexget import plugin
 from flexget.entry import Entry
+from flexget.event import event
 from flexget.utils.cached_input import cached
-from flexget.plugin import register_plugin, internet
 
 log = logging.getLogger('regexp_parse')
 
@@ -143,17 +146,14 @@ class RegexpParse(object):
                 return False
         return entry.isvalid()
 
-    @cached('text')
-    @internet(log)
+    @cached('regexp_parse')
+    @plugin.internet(log)
     def on_task_input(self, task, config):
-
-        entries = []
-
         url = config['source']
 
-        #if it's a file open it and read into content
+        #if it's a file open it and read into content (assume utf-8 encoding)
         if os.path.isfile(os.path.expanduser(url)):
-            content = open(url).read()
+            content = codecs.open(url, 'r', encoding='utf-8').read()
         #else use requests to get the data
         else:
             content = task.requests.get(url).text
@@ -195,4 +195,6 @@ class RegexpParse(object):
         return entries
 
 
-register_plugin(RegexpParse, 'regexp_parse', api_ver=2)
+@event('plugin.register')
+def register_plugin():
+    plugin.register(RegexpParse, 'regexp_parse', api_ver=2)

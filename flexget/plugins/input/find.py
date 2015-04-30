@@ -1,12 +1,15 @@
 from __future__ import unicode_literals, division, absolute_import
+from datetime import datetime
 import logging
-import os
 import re
 import sys
 
+from path import path
+
+from flexget import plugin
+from flexget.config_schema import one_or_more
+from flexget.event import event
 from flexget.entry import Entry
-from flexget.plugin import register_plugin
-from flexget.utils.cached_input import cached
 
 log = logging.getLogger('find')
 
@@ -32,15 +35,17 @@ class InputFind(object):
         regexp: .*\.(avi|mkv)$
     """
 
-    def validator(self):
-        from flexget import validator
-        root = validator.factory('dict')
-        root.accept('path', key='path', required=True)
-        root.accept('list', key='path').accept('path')
-        root.accept('text', key='mask')
-        root.accept('regexp', key='regexp')
-        root.accept('boolean', key='recursive')
-        return root
+    schema = {
+        'type': 'object',
+        'properties': {
+            'path': one_or_more({'type': 'string', 'format': 'path'}),
+            'mask': {'type': 'string'},
+            'regexp': {'type': 'string', 'format': 'regex'},
+            'recursive': {'type': 'boolean'}
+        },
+        'required': ['path'],
+        'additionalProperties': False
+    }
 
     def prepare_config(self, config):
         from fnmatch import translate
@@ -55,42 +60,47 @@ class InputFind(object):
         if not config.get('regexp'):
             config['regexp'] = '.'
 
-    @cached('find')
     def on_task_input(self, task, config):
         self.prepare_config(config)
         entries = []
         match = re.compile(config['regexp'], re.IGNORECASE).match
-        # Default to utf-8 if we get None from getfilesystemencoding()
-        fs_encoding = sys.getfilesystemencoding() or 'utf-8'
-        for path in config['path']:
-            log.debug('scanning %s' % path)
-            # unicode causes problems in here (#989)
-            path = path.encode(fs_encoding)
-            path = os.path.expanduser(path)
-            for item in os.walk(path):
-                log.debug('item: %s' % str(item))
-                for name in item[2]:
-                    # If mask fails continue
-                    if match(name) is None:
+        for folder in config['path']:
+            folder = path(folder).expanduser()
+            log.debug('scanning %s' % folder)
+            if config['recursive']:
+                files = folder.walk(errors='ignore')
+            else:
+                files = folder.listdir()
+            for item in files:
+                e = Entry()
+                try:
+                    # TODO: config for listing files/dirs/both
+                    if item.isdir():
                         continue
-                    e = Entry()
-                    try:
-                        # Convert back to unicode
-                        e['title'] = os.path.splitext(name.decode(fs_encoding))[0]
-                    except UnicodeDecodeError:
-                        log.warning('Filename `%r` in `%s` encoding broken?' %
-                                    (name.decode('utf-8', 'replace'), item[0]))
-                        continue
-                    filepath = os.path.join(item[0], name).decode(fs_encoding)
-                    e['location'] = filepath
-                    # Windows paths need an extra / prepended to them for url
-                    if not filepath.startswith('/'):
-                        filepath = '/' + filepath
-                    e['url'] = 'file://%s' % (filepath)
-                    entries.append(e)
-                # If we are not searching recursively, break after first (base) directory
-                if not config['recursive']:
-                    break
+                except UnicodeError as e:
+                    log.warning('Filename `%s` in `%s` is not decodable by declared filesystem encoding `%s`. '
+                                'Either your environment does not declare the correct encoding, or this filename '
+                                'is incorrectly encoded.' %
+                                (item.name, item.dirname(), sys.getfilesystemencoding()))
+                    continue
+
+
+                e['title'] = item.namebase
+                # If mask fails continue
+                if not match(item.name):
+                    continue
+                try:
+                    e['timestamp'] = datetime.fromtimestamp(item.getmtime())
+                except ValueError as e:
+                    log.debug('Error setting timestamp for %s: %s' % (item, e))
+                e['location'] = item
+                # Windows paths need an extra / prepended to them for url
+                if not item.startswith('/'):
+                    item = '/' + item
+                e['url'] = 'file://%s' % item
+                entries.append(e)
         return entries
 
-register_plugin(InputFind, 'find', api_ver=2)
+@event('plugin.register')
+def register_plugin():
+    plugin.register(InputFind, 'find', api_ver=2)

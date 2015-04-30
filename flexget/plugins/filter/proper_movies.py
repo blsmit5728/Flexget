@@ -1,15 +1,17 @@
 from __future__ import unicode_literals, division, absolute_import
+from datetime import datetime
 import logging
+
+from sqlalchemy import Column, Integer, String, Unicode, DateTime
 from sqlalchemy.schema import Index
 from sqlalchemy.sql.expression import desc
-from flexget.event import fire_event
+
+from flexget import plugin
+from flexget.event import fire_event, event
 from flexget.manager import Base
-from flexget.plugin import register_plugin, get_plugin_by_name, PluginError
 from flexget.utils.log import log_once
-from flexget.utils.titles.movie import MovieParser
+from flexget.plugin import get_plugin_by_name
 from flexget.utils.tools import parse_timedelta
-from sqlalchemy import Column, Integer, String, Unicode, DateTime
-from datetime import datetime
 
 log = logging.getLogger('proper_movies')
 
@@ -54,12 +56,12 @@ class FilterProperMovies(object):
         Value no will disable plugin.
     """
 
-    def validator(self):
-        from flexget import validator
-        root = validator.factory('root')
-        root.accept('boolean')
-        root.accept('interval')
-        return root
+    schema = {
+        'oneOf': [
+            {'type': 'boolean'},
+            {'type': 'string', 'format': 'interval'}
+        ]
+    }
 
     def on_task_filter(self, task, config):
         log.debug('check for enforcing')
@@ -77,16 +79,13 @@ class FilterProperMovies(object):
             try:
                 timeframe = parse_timedelta(config)
             except ValueError:
-                raise PluginError('Invalid time format', log)
+                raise plugin.PluginError('Invalid time format', log)
 
         # throws DependencyError if not present aborting task
-        imdb_lookup = get_plugin_by_name('imdb_lookup').instance
+        imdb_lookup = plugin.get_plugin_by_name('imdb_lookup').instance
 
         for entry in task.entries:
-
-            parser = MovieParser()
-            parser.data = entry['title']
-            parser.parse()
+            parser = get_plugin_by_name('parsing').instance.parse_movie(entry['title'])
 
             # if we have imdb_id already evaluated
             if entry.get('imdb_id', None, eval_lazy=False) is None:
@@ -97,7 +96,7 @@ class FilterProperMovies(object):
                     if imdb_id is None:
                         continue
                     entry['imdb_id'] = imdb_id
-                except PluginError as pe:
+                except plugin.PluginError as pe:
                     log_once(pe.value)
                     continue
 
@@ -142,7 +141,7 @@ class FilterProperMovies(object):
                 fire_event('forget', entry['imdb_id'])
                 entry.accept('proper version of previously downloaded movie')
 
-    def on_task_exit(self, task, config):
+    def on_task_learn(self, task, config):
         """Add downloaded movies to the database"""
         log.debug('check for learning')
         for entry in task.accepted:
@@ -150,9 +149,7 @@ class FilterProperMovies(object):
                 log.debug('`%s` does not have imdb_id' % entry['title'])
                 continue
 
-            parser = MovieParser()
-            parser.data = entry['title']
-            parser.parse()
+            parser = get_plugin_by_name('parsing').instance.parse_movie(entry['title'])
 
             quality = parser.quality.name
 
@@ -177,4 +174,6 @@ class FilterProperMovies(object):
             else:
                 log.debug('%s already exists' % proper_movie)
 
-register_plugin(FilterProperMovies, 'proper_movies', api_ver=2)
+@event('plugin.register')
+def register_plugin():
+    plugin.register(FilterProperMovies, 'proper_movies', api_ver=2)

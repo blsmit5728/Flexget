@@ -1,9 +1,12 @@
 from __future__ import unicode_literals, division, absolute_import
-import os
 import logging
+import platform
 
+from path import path
+
+from flexget import plugin
+from flexget.event import event
 from flexget.config_schema import one_or_more
-from flexget.plugin import register_plugin, priority, PluginWarning
 
 log = logging.getLogger('exists')
 
@@ -20,34 +23,39 @@ class FilterExists(object):
 
     schema = one_or_more({'type': 'string', 'format': 'path'})
 
-    def get_config(self, task):
-        config = task.config.get('exists', None)
+    def prepare_config(self, config):
         # If only a single path is passed turn it into a 1 element list
         if isinstance(config, basestring):
             config = [config]
         return config
 
-    @priority(-1)
-    def on_task_filter(self, task):
+    @plugin.priority(-1)
+    def on_task_filter(self, task, config):
         if not task.accepted:
             log.debug('No accepted entries, not scanning for existing.')
             return
         log.verbose('Scanning path(s) for existing files.')
-        config = self.get_config(task)
-        for path in config:
-            # unicode path causes crashes on some paths
-            path = str(os.path.expanduser(path))
-            if not os.path.exists(path):
-                raise PluginWarning('Path %s does not exist' % path, log)
-            # scan through
-            for root, dirs, files in os.walk(path, followlinks=True):
-                # convert filelists into utf-8 to avoid unicode problems
-                dirs = [x.decode('utf-8', 'ignore') for x in dirs]
-                files = [x.decode('utf-8', 'ignore') for x in files]
-                for entry in task.accepted:
-                    name = entry['title']
-                    if name in dirs or name in files:
-                        log.debug('Found %s in %s' % (name, root))
-                        entry.reject(os.path.join(root, name))
+        config = self.prepare_config(config)
+        filenames = {}
+        for folder in config:
+            folder = path(folder).expanduser()
+            if not folder.exists():
+                raise plugin.PluginWarning('Path %s does not exist' % folder, log)
+            for p in folder.walk(errors='ignore'):
+                key = p.name
+                # windows file system is not case sensitive
+                if platform.system() == 'Windows':
+                    key = key.lower()
+                filenames[key] = p
+        for entry in task.accepted:
+            # priority is: filename, location (filename only), title
+            name = path(entry.get('filename', entry.get('location', entry['title']))).name
+            if platform.system() == 'Windows':
+                name = name.lower()
+            if name in filenames:
+                log.debug('Found %s in %s' % (name, filenames[name]))
+                entry.reject('exists in %s' % filenames[name])
 
-register_plugin(FilterExists, 'exists')
+@event('plugin.register')
+def register_plugin():
+    plugin.register(FilterExists, 'exists', api_ver=2)

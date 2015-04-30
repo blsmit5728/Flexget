@@ -1,23 +1,21 @@
 from __future__ import unicode_literals, division, absolute_import
 import logging
 
-from flexget import validator
+from flexget import plugin
 from flexget.entry import Entry
-from flexget.plugin import register_plugin
+from flexget.event import event
 from flexget.utils import requests, json
 from flexget.utils.search import torrent_availability
 
-session = requests.Session()
 log = logging.getLogger('search_btn')
 
 # TODO: btn has a limit of 150 searches per hour
 
 
 class SearchBTN(object):
-    def validator(self):
-        return validator.factory('text')
+    schema = {'type': 'string'}
 
-    def search(self, entry, config):
+    def search(self, task, entry, config):
         api_key = config
 
         searches = entry.get('search_strings', [entry['title']])
@@ -29,14 +27,15 @@ class SearchBTN(object):
                 if entry.get('series_id_type') == 'sequence':
                     search['name'] = 'S01E%02d' % entry['series_id']
                 else:
-                    search['name'] = entry['series_id']
+                    search['name'] = entry['series_id'] + '%' # added wildcard search for better results.
             searches = [search]
 
         results = set()
         for search in searches:
             data = json.dumps({'method': 'getTorrents', 'params': [api_key, search], 'id': 1})
             try:
-                r = session.post('http://api.btnapps.net/', data=data, headers={'Content-type': 'application/json'})
+                r = task.requests.post('http://api.btnapps.net/',
+                                       data=data, headers={'Content-type': 'application/json'})
             except requests.RequestException as e:
                 log.error('Error searching btn: %s' % e)
                 continue
@@ -62,5 +61,6 @@ class SearchBTN(object):
         return results
 
 
-
-register_plugin(SearchBTN, 'btn', groups=['search'], debug=True)
+@event('plugin.register')
+def register_plugin():
+    plugin.register(SearchBTN, 'btn', groups=['search'], api_ver=2)

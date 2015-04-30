@@ -1,8 +1,10 @@
 from __future__ import unicode_literals, division, absolute_import
 import os
 import logging
-from flexget.plugin import register_plugin
-from flexget.utils.template import render_from_task, get_template
+
+from flexget import plugin
+from flexget.event import event
+from flexget.utils.template import render_from_task, get_template, RenderError
 
 PLUGIN_NAME = 'make_html'
 
@@ -33,10 +35,15 @@ class OutputHtml:
             output = os.path.join(task.manager.config_base, output)
 
         # create the template
-        template = render_from_task(get_template(filename, PLUGIN_NAME), task)
+        try:
+            template = render_from_task(get_template(filename, PLUGIN_NAME), task)
+            log.verbose('Writing output html to %s' % output)
+            with open(output, 'w') as f:
+                f.write(template.encode('utf-8'))
+        except RenderError as e:
+            log.error('Error while rendering task %s, Error: %s' % (task, e))
+            raise plugin.PluginError('There was an error rendering the specified template')
 
-        log.verbose('Writing output html to %s' % output)
-        with open(output, 'w') as f:
-            f.write(template.encode('utf-8'))
-
-register_plugin(OutputHtml, PLUGIN_NAME, api_ver=2)
+@event('plugin.register')
+def register_plugin():
+    plugin.register(OutputHtml, PLUGIN_NAME, api_ver=2)

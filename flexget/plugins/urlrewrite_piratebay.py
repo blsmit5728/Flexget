@@ -2,15 +2,22 @@ from __future__ import unicode_literals, division, absolute_import
 import re
 import urllib
 import logging
-from flexget.plugins.plugin_urlrewriting import UrlRewritingError
+
+from flexget import plugin
 from flexget.entry import Entry
-from flexget.plugin import register_plugin, internet, PluginWarning
+from flexget.event import event
+from flexget.plugins.plugin_urlrewriting import UrlRewritingError
 from flexget.utils import requests
 from flexget.utils.soup import get_soup
 from flexget.utils.search import torrent_availability, normalize_unicode
-from flexget import validator
 
 log = logging.getLogger('piratebay')
+
+CUR_TLD = 'se'
+TLDS = 'com|org|sx|ac|pe|gy|se|%s' % CUR_TLD
+
+URL_MATCH = re.compile('^http://(?:torrents\.)?thepiratebay\.(?:%s)/.*$' % TLDS)
+URL_SEARCH = re.compile('^http://thepiratebay\.(?:%s)/search/.*$' % TLDS)
 
 CATEGORIES = {
     'all': 0,
@@ -35,27 +42,32 @@ SORT = {
 class UrlRewritePirateBay(object):
     """PirateBay urlrewriter."""
 
-    def validator(self):
-        root = validator.factory()
-        root.accept('boolean')
-        advanced = root.accept('dict')
-        advanced.accept('choice', key='category').accept_choices(CATEGORIES)
-        advanced.accept('integer', key='category')
-        advanced.accept('choice', key='sort_by').accept_choices(SORT)
-        advanced.accept('boolean', key='sort_reverse')
-        return root
+    schema = {
+        'oneOf': [
+            {'type': 'boolean'},
+            {
+                'type': 'object',
+                'properties': {
+                    'category': {
+                        'oneOf': [
+                            {'type': 'string', 'enum': list(CATEGORIES)},
+                            {'type': 'integer'}
+                        ]
+                    },
+                    'sort_by': {'type': 'string', 'enum': list(SORT)},
+                    'sort_reverse': {'type': 'boolean'}
+                },
+                'additionalProperties': False
+            }
+        ]
+    }
 
     # urlrewriter API
     def url_rewritable(self, task, entry):
         url = entry['url']
         if url.endswith('.torrent'):
             return False
-        url = url.replace('thepiratebay.org', 'thepiratebay.se')
-        if url.startswith('http://thepiratebay.se/'):
-            return True
-        if url.startswith('http://torrents.thepiratebay.se/'):
-            return True
-        return False
+        return bool(URL_MATCH.match(url))
 
     # urlrewriter API
     def url_rewrite(self, task, entry):
@@ -63,9 +75,9 @@ class UrlRewritePirateBay(object):
             log.error("Didn't actually get a URL...")
         else:
             log.debug("Got the URL: %s" % entry['url'])
-        if entry['url'].startswith(('http://thepiratebay.se/search/', 'http://thepiratebay.org/search/')):
+        if URL_SEARCH.match(entry['url']):
             # use search
-            results = self.search(entry)
+            results = self.search(task, entry)
             if not results:
                 raise UrlRewritingError("No search results found")
             # TODO: Close matching was taken out of search methods, this may need to be fixed to be more picky
@@ -74,9 +86,9 @@ class UrlRewritePirateBay(object):
             # parse download page
             entry['url'] = self.parse_download_page(entry['url'])
 
-    @internet(log)
+    @plugin.internet(log)
     def parse_download_page(self, url):
-        page = requests.get(url).content
+        page = requests.get(url,verify=False).content
         try:
             soup = get_soup(page)
             tag_div = soup.find('div', attrs={'class': 'download'})
@@ -91,8 +103,8 @@ class UrlRewritePirateBay(object):
         except Exception as e:
             raise UrlRewritingError(e)
 
-    @internet(log)
-    def search(self, arg_entry, config=None):
+    @plugin.internet(log)
+    def search(self, task, entry, config=None):
         """
         Search for name from piratebay.
         """
@@ -108,19 +120,19 @@ class UrlRewritePirateBay(object):
         filter_url = '/0/%d/%d' % (sort, category)
 
         entries = set()
-        for search_string in arg_entry.get('search_string', [arg_entry['title']]):
+        for search_string in entry.get('search_strings', [entry['title']]):
             query = normalize_unicode(search_string)
             # TPB search doesn't like dashes
             query = query.replace('-', ' ')
             # urllib.quote will crash if the unicode string has non ascii characters, so encode in utf-8 beforehand
-            url = 'http://thepiratebay.se/search/' + urllib.quote(query.encode('utf-8')) + filter_url
+            url = 'http://thepiratebay.%s/search/%s%s' % (CUR_TLD, urllib.quote(query.encode('utf-8')), filter_url)
             log.debug('Using %s as piratebay search url' % url)
-            page = requests.get(url).content
+            page = requests.get(url,verify=False).content
             soup = get_soup(page)
             for link in soup.find_all('a', attrs={'class': 'detLink'}):
                 entry = Entry()
                 entry['title'] = link.contents[0]
-                entry['url'] = 'http://thepiratebay.se' + link.get('href')
+                entry['url'] = 'http://thepiratebay.%s%s' % (CUR_TLD, link.get('href'))
                 tds = link.parent.parent.parent.find_all('td')
                 entry['torrent_seeds'] = int(tds[-2].contents[0])
                 entry['torrent_leeches'] = int(tds[-1].contents[0])
@@ -139,4 +151,7 @@ class UrlRewritePirateBay(object):
 
         return sorted(entries, reverse=True, key=lambda x: x.get('search_sort'))
 
-register_plugin(UrlRewritePirateBay, 'piratebay', groups=['urlrewriter', 'search'])
+
+@event('plugin.register')
+def register_plugin():
+    plugin.register(UrlRewritePirateBay, 'piratebay', groups=['urlrewriter', 'search'], api_ver=2)

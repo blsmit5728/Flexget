@@ -1,16 +1,14 @@
 from __future__ import unicode_literals, division, absolute_import
 import logging
+import urllib
 
 from requests import RequestException
 
-from flexget.plugin import register_plugin, priority
+from flexget import plugin
+from flexget.event import event
 from flexget.utils.template import RenderError
 
-__version__ = 0.1
-
 log = logging.getLogger('prowl')
-
-headers = {'User-Agent': 'FlexGet Prowl plugin/%s' % str(__version__)}
 
 
 class OutputProwl(object):
@@ -28,30 +26,22 @@ class OutputProwl(object):
 
     Configuration parameters are also supported from entries (eg. through set).
     """
-
-    def validator(self):
-        from flexget import validator
-        config = validator.factory('dict')
-        config.accept('text', key='apikey', required=True)
-        config.accept('text', key='application')
-        config.accept('text', key='event')
-        config.accept('integer', key='priority')
-        config.accept('text', key='description')
-        return config
-
-    def prepare_config(self, config):
-        if isinstance(config, bool):
-            config = {'enabled': config}
-        config.setdefault('apikey', '')
-        config.setdefault('application', 'FlexGet')
-        config.setdefault('event', 'New release')
-        config.setdefault('priority', 0)
-        return config
+    schema = {
+        'type': 'object',
+        'properties': {
+            'apikey': {'type': 'string'},
+            'application': {'type': 'string', 'default': 'FlexGet'},
+            'event': {'type': 'string', 'default': 'New Release'},
+            'priority': {'type': 'integer', 'default': 0},
+            'description': {'type': 'string'}
+        },
+        'required': ['apikey'],
+        'additionalProperties': False
+    }
 
     # Run last to make sure other outputs are successful before sending notification
-    @priority(0)
+    @plugin.priority(0)
     def on_task_output(self, task, config):
-        config = self.prepare_config(config)
         for entry in task.accepted:
 
             # get the parameters
@@ -74,17 +64,17 @@ class OutputProwl(object):
                 description = entry['title']
                 log.error('Error rendering jinja description: %s' % e)
 
-            url = 'https://prowl.weks.net/publicapi/add'
+            url = 'https://api.prowlapp.com/publicapi/add'
             data = {'priority': priority, 'application': application, 'apikey': apikey,
-                    'event': event, 'description': description}
+                    'event': event.encode('utf-8'), 'description': description}
 
-            if task.manager.options.test:
+            if task.options.test:
                 log.info('Would send prowl message about: %s', entry['title'])
                 log.debug('options: %s' % data)
                 continue
 
             try:
-                response = task.requests.post(url, headers=headers, data=data, raise_status=False)
+                response = task.requests.post(url, data=data, raise_status=False)
             except RequestException as e:
                 log.error('Error with request: %s' % e)
                 continue
@@ -101,9 +91,14 @@ class OutputProwl(object):
                 log.error("Not authorized, the API key given is not valid, and does not correspond to a user.")
             elif request_status == 406:
                 log.error("Not acceptable, your IP address has exceeded the API limit.")
+            elif request_status == 409:
+                log.error("Not approved, the user has yet to approve your retrieve request.")
             elif request_status == 500:
                 log.error("Internal server error, something failed to execute properly on the Prowl side.")
             else:
                 log.error("Unknown error when sending Prowl message")
 
-register_plugin(OutputProwl, 'prowl', api_ver=2)
+
+@event('plugin.register')
+def register_plugin():
+    plugin.register(OutputProwl, 'prowl', api_ver=2)

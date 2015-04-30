@@ -2,17 +2,17 @@ from __future__ import unicode_literals, division, absolute_import
 import logging
 import re
 import urllib
-import urllib2
 import feedparser
 
-from flexget.plugin import register_plugin, PluginWarning
+from flexget import plugin
 from flexget.entry import Entry
+from flexget.event import event
+from flexget.utils import requests
 from flexget.utils.search import torrent_availability, normalize_unicode
-from flexget import validator
 
 log = logging.getLogger('torrentz')
 
-REGEXP = re.compile(r'http://torrentz\.eu/(?P<hash>[a-f0-9]{40})')
+REGEXP = re.compile(r'https?://torrentz\.(eu|me|ch|in)/(?P<hash>[a-f0-9]{40})')
 REPUTATIONS = {  # Maps reputation name to feed address
     'any': 'feed_any',
     'low': 'feed_low',
@@ -24,45 +24,62 @@ REPUTATIONS = {  # Maps reputation name to feed address
 class UrlRewriteTorrentz(object):
     """Torrentz urlrewriter."""
 
-    def validator(self):
-        root = validator.factory('choice')
-        root.accept_choices(REPUTATIONS)
-        return root
+    schema = {
+        'oneOf': [
+            {
+                'title': 'specify options',
+                'type': 'object',
+                'properties': {
+                    'reputation': {'enum': list(REPUTATIONS), 'default': 'good'},
+                    'extra_terms': {'type': 'string'}
+                },
+                'additionalProperties': False
+            },
+            {'title': 'specify reputation', 'enum': list(REPUTATIONS), 'default': 'good'}
+        ]
+    }
+
+    def process_config(self, config):
+        """Return plugin configuration in advanced form"""
+        if isinstance(config, basestring):
+            config = {'reputation': config}
+        if config.get('extra_terms'):
+            config['extra_terms'] = ' '+config['extra_terms']
+        return config
 
     def url_rewritable(self, task, entry):
         return REGEXP.match(entry['url'])
 
     def url_rewrite(self, task, entry):
-        thash = REGEXP.match(entry['url']).group(1)
+        thash = REGEXP.match(entry['url']).group(2)
         entry['url'] = 'https://torcache.net/torrent/%s.torrent' % thash.upper()
         entry['torrent_info_hash'] = thash
 
-    def search(self, entry, config=None):
-        if config:
-            feed = REPUTATIONS[config]
-        else:
-            feed = REPUTATIONS['good']
+    def search(self, task, entry, config=None):
+        config = self.process_config(config)
+        feed = REPUTATIONS[config['reputation']]
         entries = set()
-        for search_string in entry.get('search_string', [entry['title']]):
-            query = normalize_unicode(search_string)
-            # urllib.quote will crash if the unicode string has non ascii characters, so encode in utf-8 beforehand
-            url = 'http://torrentz.eu/%s?q=%s' % (feed, urllib.quote(query.encode('utf-8')))
-            log.debug('requesting: %s' % url)
-            try:
-                opened = urllib2.urlopen(url)
-            except urllib2.URLError, err:
-                raise PluginWarning('Error requesting URL: %s' % err)
-            rss = feedparser.parse(opened)
+        for search_string in entry.get('search_strings', [entry['title']]):
+            query = normalize_unicode(search_string+config.get('extra_terms', ''))
+            for domain in ['eu', 'me', 'ch', 'in']:
+                # urllib.quote will crash if the unicode string has non ascii characters, so encode in utf-8 beforehand
+                url = 'http://torrentz.%s/%s?q=%s' % (domain, feed, urllib.quote(query.encode('utf-8')))
+                log.debug('requesting: %s' % url)
+                try:
+                    r = requests.get(url)
+                    break
+                except requests.RequestException as err:
+                    log.warning('torrentz.%s failed. Error: %s' % (domain, err))
+            else:
+                raise plugin.PluginError('Error getting torrentz search results')
 
-            status = rss.get('status', False)
-            if status != 200:
-                raise PluginWarning(
-                    'Search result not 200 (OK), received %s %s' %
-                    (status, opened.msg))
+            if not r.content.strip():
+                raise plugin.PluginError('No data from %s. Maybe torrentz is blocking the FlexGet User-Agent' % url)
 
-            ex = rss.get('bozo_exception', False)
-            if ex:
-                raise PluginWarning('Got bozo_exception (bad feed)')
+            rss = feedparser.parse(r.content)
+
+            if rss.get('bozo_exception'):
+                raise plugin.PluginError('Got bozo_exception (bad rss feed)')
 
             for item in rss.entries:
                 m = re.search(r'Size: ([\d]+) Mb Seeds: ([,\d]+) Peers: ([,\d]+) Hash: ([a-f0-9]+)',
@@ -84,4 +101,7 @@ class UrlRewriteTorrentz(object):
         log.debug('Search got %d results' % len(entries))
         return entries
 
-register_plugin(UrlRewriteTorrentz, 'torrentz', groups=['urlrewriter', 'search'])
+
+@event('plugin.register')
+def register_plugin():
+    plugin.register(UrlRewriteTorrentz, 'torrentz', groups=['urlrewriter', 'search'], api_ver=2)

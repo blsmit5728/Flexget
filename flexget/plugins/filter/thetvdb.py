@@ -1,6 +1,8 @@
 from __future__ import unicode_literals, division, absolute_import
 import logging
-from flexget.plugin import register_plugin, priority, get_plugin_by_name, PluginError
+
+from flexget import plugin
+from flexget.event import event
 from flexget.utils.log import log_once
 
 log = logging.getLogger('thetvdb')
@@ -79,31 +81,33 @@ class FilterTvdb(object):
             - John Terlesky
     """
 
-    def validator(self):
-        """Validate given configuration"""
-        from flexget import validator
-        thetvdb = validator.factory('dict')
-        thetvdb.accept('number', key='min_series_rating')
-        thetvdb.accept('number', key='min_episode_rating')
-        thetvdb.accept('integer', key='min_episode_air_year')
-        thetvdb.accept('integer', key='max_episode_air_year')
-        thetvdb.accept('number', key='min_episode_runtime')
-        thetvdb.accept('number', key='max_episode_runtime')
-        thetvdb.accept('list', key='reject_content_rating').accept('text')
-        thetvdb.accept('list', key='accept_content_rating').accept('text')
-        thetvdb.accept('list', key='accept_network').accept('text')
-        thetvdb.accept('list', key='reject_network').accept('text')
-        thetvdb.accept('list', key='reject_genres').accept('text')
-        thetvdb.accept('list', key='reject_status').accept('text')
-        thetvdb.accept('list', key='reject_languages').accept('text')
-        thetvdb.accept('list', key='accept_languages').accept('text')
-        thetvdb.accept('list', key='accept_actors').accept('text')
-        thetvdb.accept('list', key='reject_actors').accept('text')
-        thetvdb.accept('list', key='accept_writers').accept('text')
-        thetvdb.accept('list', key='reject_writers').accept('text')
-        thetvdb.accept('list', key='accept_directors').accept('text')
-        thetvdb.accept('list', key='reject_directors').accept('text')
-        return thetvdb
+    schema = {
+        'type': 'object',
+        'properties': {
+            'min_series_rating': {'type': 'number'},
+            'min_episode_rating': {'type': 'number'},
+            'min_episode_air_year': {'type': 'integer'},
+            'max_episode_air_year': {'type': 'integer'},
+            'min_episode_runtime': {'type': 'number'},
+            'max_episode_runtime': {'type': 'number'},
+            'reject_content_rating': {'type': 'array', 'items': {'type': 'string'}},
+            'accept_content_rating': {'type': 'array', 'items': {'type': 'string'}},
+            'accept_network': {'type': 'array', 'items': {'type': 'string'}},
+            'reject_network': {'type': 'array', 'items': {'type': 'string'}},
+            'reject_genres': {'type': 'array', 'items': {'type': 'string'}},
+            'reject_status': {'type': 'array', 'items': {'type': 'string'}},
+            'reject_languages': {'type': 'array', 'items': {'type': 'string'}},
+            'accept_languages': {'type': 'array', 'items': {'type': 'string'}},
+            'accept_actors': {'type': 'array', 'items': {'type': 'string'}},
+            'reject_actors': {'type': 'array', 'items': {'type': 'string'}},
+            'accept_writers': {'type': 'array', 'items': {'type': 'string'}},
+            'reject_writers': {'type': 'array', 'items': {'type': 'string'}},
+            'accept_directors': {'type': 'array', 'items': {'type': 'string'}},
+            'reject_directors': {'type': 'array', 'items': {'type': 'string'}},
+
+        },
+        'additionalProperties': False
+    }
 
     def is_in_set(self, config, configkey, entryitem,):
         '''
@@ -125,18 +129,17 @@ class FilterTvdb(object):
                     return True
         return False
 
-    @priority(126)
-    def on_task_filter(self, task):
-        config = task.config['thetvdb']
+    @plugin.priority(126)
+    def on_task_filter(self, task, config):
 
-        lookup = get_plugin_by_name('thetvdb_lookup').instance.lookup
+        lookup = plugin.get_plugin_by_name('thetvdb_lookup').instance.lookup
 
         for entry in task.entries:
             force_accept = False
 
             try:
                 lookup(task, entry)
-            except PluginError as e:
+            except plugin.PluginError as e:
                 log.error('Skipping %s because of an error: %s' % (entry['title'], e.value))
                 continue
 
@@ -203,7 +206,7 @@ class FilterTvdb(object):
             if reasons and not force_accept:
                 msg = 'Skipping %s because of rule(s) %s' % \
                     (entry.get('series_name_thetvdb', None) or entry['title'], ', '.join(reasons))
-                if task.manager.options.debug:
+                if task.options.debug:
                     log.debug(msg)
                 else:
                     log_once(msg, log)
@@ -211,4 +214,7 @@ class FilterTvdb(object):
                 log.debug('Accepting %s' % (entry))
                 entry.accept()
 
-register_plugin(FilterTvdb, 'thetvdb')
+
+@event('plugin.register')
+def register_plugin():
+    plugin.register(FilterTvdb, 'thetvdb', api_ver=2)

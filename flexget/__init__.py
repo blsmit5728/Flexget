@@ -1,50 +1,39 @@
 #!/usr/bin/python
+from __future__ import unicode_literals, division, absolute_import, print_function
 
-from __future__ import unicode_literals, division, absolute_import
+from ._version import __version__
+
+import logging
 import os
 import sys
-import logging
-from flexget import logger
-from flexget.options import CoreArgumentParser
-from flexget import plugin
-from flexget.manager import Manager
 
-__version__ = '{git}'
+from flexget import logger, plugin
+from flexget.manager import Manager
 
 log = logging.getLogger('main')
 
 
-def main():
+def main(args=None):
     """Main entry point for Command Line Interface"""
 
     logger.initialize()
 
-    parser = CoreArgumentParser()
-    plugin.load_plugins(parser)
-
-    options = parser.parse_args()
-
     try:
-        manager = Manager(options)
-    except IOError as e:
-        # failed to load config, TODO: why should it be handled here? So sys.exit isn't called in webui?
-        log.critical(e)
-        logger.flush_logging_to_console()
+        manager = Manager(args)
+    except (IOError, ValueError) as e:
+        print('Could not instantiate manager: %s' % e, file=sys.stderr)
         sys.exit(1)
 
-    log_level = logging.getLevelName(options.loglevel.upper())
-    log_file = os.path.expanduser(manager.options.logfile)
-    # If an absolute path is not specified, use the config directory.
-    if not os.path.isabs(log_file):
-        log_file = os.path.join(manager.config_base, log_file)
-    logger.start(log_file, log_level)
-
-    if options.profile:
-        try:
-            import cProfile as profile
-        except ImportError:
-            import profile
-        profile.runctx('manager.execute()', globals(), locals(), os.path.join(manager.config_base, 'flexget.profile'))
-    else:
-        manager.execute()
-    manager.shutdown()
+    try:
+        if manager.options.profile:
+            try:
+                import cProfile as profile
+            except ImportError:
+                import profile
+            profile.runctx('manager.start()', globals(), locals(),
+                           os.path.join(manager.config_base, manager.options.profile))
+        else:
+            manager.start()
+    except (IOError, ValueError) as e:
+        print('Could not start manager: %s' % e, file=sys.stderr)
+        sys.exit(1)

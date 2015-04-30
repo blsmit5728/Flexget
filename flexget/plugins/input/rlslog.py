@@ -2,10 +2,13 @@ from __future__ import unicode_literals, division, absolute_import
 import logging
 import re
 import time
+
 from requests import RequestException
-from bs4 import NavigableString
+
+from flexget import plugin
 from flexget.entry import Entry
-from flexget.plugin import register_plugin, internet, get_plugin_by_name, PluginError
+from flexget.event import event
+from flexget.utils.imdb import extract_id
 from flexget.utils.log import log_once
 from flexget.utils.soup import get_soup
 from flexget.utils.cached_input import cached
@@ -17,10 +20,7 @@ class RlsLog(object):
     """
     Adds support for rlslog.net as a feed.
     """
-
-    def validator(self):
-        from flexget import validator
-        return validator.factory('url')
+    schema = {'type': 'string', 'format': 'url'}
 
     def parse_rlslog(self, rlslog_url, task):
         """
@@ -50,6 +50,7 @@ class RlsLog(object):
             # find imdb url
             link_imdb = entrybody.find('a', text=re.compile(r'imdb', re.IGNORECASE))
             if link_imdb:
+                release['imdb_id'] = extract_id(link_imdb['href'])
                 release['imdb_url'] = link_imdb['href']
 
             # find google search url
@@ -63,11 +64,11 @@ class RlsLog(object):
         return releases
 
     @cached('rlslog')
-    @internet(log)
+    @plugin.internet(log)
     def on_task_input(self, task, config):
         url = config
         if url.endswith('feed/'):
-            raise PluginError('Invalid URL. Remove trailing feed/ from the url.')
+            raise plugin.PluginError('Invalid URL. Remove trailing feed/ from the url.')
 
         releases = []
         entries = []
@@ -101,4 +102,7 @@ class RlsLog(object):
 
         return entries
 
-register_plugin(RlsLog, 'rlslog', api_ver=2)
+
+@event('plugin.register')
+def register_plugin():
+    plugin.register(RlsLog, 'rlslog', api_ver=2)

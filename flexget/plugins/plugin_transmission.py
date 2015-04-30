@@ -1,14 +1,20 @@
 from __future__ import unicode_literals, division, absolute_import
 import os
+from datetime import datetime
+from datetime import timedelta
 from netrc import netrc, NetrcParseError
 import logging
 import base64
 
-from flexget.plugin import register_plugin, priority, get_plugin_by_name, PluginError
-from flexget import validator
+from flexget import plugin, validator
 from flexget.entry import Entry
+from flexget.event import event
 from flexget.utils.template import RenderError
 from flexget.utils.pathscrub import pathscrub
+from flexget.utils.tools import parse_timedelta
+
+from flexget.config_schema import one_or_more
+from fnmatch import fnmatch
 
 log = logging.getLogger('transmission')
 
@@ -54,6 +60,7 @@ class TransmissionBase(object):
         config.setdefault('enabled', True)
         config.setdefault('host', 'localhost')
         config.setdefault('port', 9091)
+        config.setdefault('main_file_ratio', 0.9)
         if 'netrc' in config:
             netrc_path = os.path.expanduser(config['netrc'])
             try:
@@ -76,33 +83,69 @@ class TransmissionBase(object):
         except TransmissionError as e:
             if isinstance(e.original, HTTPHandlerError):
                 if e.original.code == 111:
-                    raise PluginError("Cannot connect to transmission. Is it running?")
+                    raise plugin.PluginError("Cannot connect to transmission. Is it running?")
                 elif e.original.code == 401:
-                    raise PluginError("Username/password for transmission is incorrect. Cannot connect.")
+                    raise plugin.PluginError("Username/password for transmission is incorrect. Cannot connect.")
                 elif e.original.code == 110:
-                    raise PluginError("Cannot connect to transmission: Connection timed out.")
+                    raise plugin.PluginError("Cannot connect to transmission: Connection timed out.")
                 else:
-                    raise PluginError("Error connecting to transmission: %s" % e.original.message)
+                    raise plugin.PluginError("Error connecting to transmission: %s" % e.original.message)
             else:
-                raise PluginError("Error connecting to transmission: %s" % e.message)
+                raise plugin.PluginError("Error connecting to transmission: %s" % e.message)
         return cli
 
+    def torrent_info(self, torrent, config):
+        done = torrent.totalSize > 0
+        vloc = None
+        best = None
+        for t in torrent.files().iteritems():
+            tf = t[1]
+            if tf['selected']:
+                if tf['size'] <= 0 or tf['completed'] < tf['size']:
+                    done = False
+                    break
+                if not best or tf['size'] > best[1]:
+                    best = (tf['name'], tf['size'])
+        if done and best and (100 * float(best[1]) / float(torrent.totalSize)) >= (config['main_file_ratio'] * 100):
+            vloc = ('%s/%s' % (torrent.downloadDir, best[0])).replace('/', os.sep)
+        return done, vloc
+
+    def check_seed_limits(self, torrent, session):
+        seed_limit_ok = None  # will remain if no seed ratio defined
+        idle_limit_ok = None  # will remain if no idle limit defined
+
+        if torrent.seedRatioMode == 1:  # use torrent's own seed ratio limit
+            seed_limit_ok = torrent.uploadRatio >= torrent.seedRatioLimit
+        elif torrent.seedRatioMode == 0:  # use global rules
+            if session.seedRatioLimited:
+                seed_limit_ok = torrent.uploadRatio >= session.seedRatioLimit
+
+        if torrent.seedIdleMode == 1:  # use torrent's own idle limit
+            idle_limit_ok = torrent.date_active + timedelta(minutes=torrent.seedIdleLimit) < datetime.now()
+        elif torrent.seedIdleMode == 0:  # use global rules
+            if session.idle_seeding_limit_enabled:
+                idle_limit_ok = torrent.date_active + timedelta(minutes=session.idle_seeding_limit) < datetime.now()
+
+        return seed_limit_ok, idle_limit_ok
+
     @save_opener
-    def on_process_start(self, task, config):
+    def on_task_start(self, task, config):
         try:
             import transmissionrpc
             from transmissionrpc import TransmissionError
             from transmissionrpc import HTTPHandlerError
         except:
-            raise PluginError('Transmissionrpc module version 0.6 or higher required.', log)
-        if [int(part) for part in transmissionrpc.__version__.split('.')] < [0, 6]:
-            raise PluginError('Transmissionrpc module version 0.6 or higher required, please upgrade', log)
-
-    @save_opener
-    def on_task_start(self, task, config):
+            raise plugin.PluginError('Transmissionrpc module version 0.11 or higher required.', log)
+        if [int(part) for part in transmissionrpc.__version__.split('.')] < [0, 11]:
+            raise plugin.PluginError('Transmissionrpc module version 0.11 or higher required, please upgrade', log)
+        """ 
+        Mark rpc client for garbage collector so every task can start 
+        a fresh new according its own config - fix to bug #2804
+        """
+        self.client = None
         config = self.prepare_config(config)
         if config['enabled']:
-            if task.manager.options.test:
+            if task.options.test:
                 log.info('Trying to connect to transmission...')
                 self.client = self.create_rpc_client(config)
                 if self.client:
@@ -141,24 +184,24 @@ class PluginTransmissionInput(TransmissionBase):
         if 'username' in config and 'password' in config:
             self.client.http_handler.set_authentication(self.client.url, config['username'], config['password'])
 
-        for torrent in self.client.info().values():
-            torrentCompleted = self._torrent_completed(torrent)
-            if not config['onlycomplete'] or torrentCompleted:
+        session = self.client.get_session()
+
+        for torrent in self.client.get_torrents():
+            downloaded, bigfella = self.torrent_info(torrent, config)
+            seed_ratio_ok, idle_limit_ok = self.check_seed_limits(torrent, session)
+            if not config['onlycomplete'] or (downloaded and torrent.status == 'stopped' and
+                                              (seed_ratio_ok is None and idle_limit_ok is None) or
+                                              (seed_ratio_ok is True or idle_limit_ok is True)):
                 entry = Entry(title=torrent.name,
                               url='file://%s' % torrent.torrentFile,
                               torrent_info_hash=torrent.hashString,
-                              content_size=torrent.totalSize/(1024*1024))
+                              content_size=torrent.totalSize / (1024 * 1024))
                 for attr in ['comment', 'downloadDir', 'isFinished', 'isPrivate']:
-                        entry['transmission_' + attr] = getattr(torrent, attr)
+                    entry['transmission_' + attr] = getattr(torrent, attr)
                 entry['transmission_trackers'] = [t['announce'] for t in torrent.trackers]
+                entry['location'] = bigfella
                 entries.append(entry)
         return entries
-
-    def _torrent_completed(self, torrent):
-        result = True
-        for tf in torrent.files().iteritems():
-            result &= (tf[1]['completed'] == tf[1]['size'])
-        return result
 
 
 class PluginTransmission(TransmissionBase):
@@ -174,7 +217,6 @@ class PluginTransmission(TransmissionBase):
         username: myusername
         password: mypassword
         path: the download location
-        removewhendone: yes
 
     Default values for the config elements::
 
@@ -182,32 +224,53 @@ class PluginTransmission(TransmissionBase):
         host: localhost
         port: 9091
         enabled: yes
-        removewhendone: no
     """
 
-    def validator(self):
-        """Return config validator"""
-        root = validator.factory()
-        root.accept('boolean')
-        advanced = root.accept('dict')
-        self._validator(advanced)
-        advanced.accept('path', key='path', allow_replacement=True)
-        advanced.accept('boolean', key='addpaused')
-        advanced.accept('boolean', key='honourlimits')
-        advanced.accept('integer', key='bandwidthpriority')
-        advanced.accept('integer', key='maxconnections')
-        advanced.accept('number', key='maxupspeed')
-        advanced.accept('number', key='maxdownspeed')
-        advanced.accept('number', key='ratio')
-        advanced.accept('boolean', key='removewhendone')
-        return root
+    schema = {
+        'anyOf': [
+            {'type': 'boolean'},
+            {
+                'type': 'object',
+                'properties': {
+                    'host': {'type': 'string'},
+                    'port': {'type': 'integer'},
+                    'netrc': {'type': 'string'},
+                    'username': {'type': 'string'},
+                    'password': {'type': 'string'},
+                    'path': {'type': 'string'},   
+                    'maxupspeed': {'type': 'number'},
+                    'maxdownspeed': {'type': 'number'},
+                    'maxconnections': {'type': 'integer'},   
+                    'ratio': {'type': 'number'},
+                    'addpaused': {'type': 'boolean'},
+                    'content_filename': {'type': 'string'},
+                    'main_file_only': {'type': 'boolean'},
+                    'main_file_ratio': {'type': 'number'},
+                    'magnetization_timeout' : {'type': 'integer'},
+                    'enabled': {'type': 'boolean'},
+                    'include_subs': {'type': 'boolean'},
+                    'bandwidthpriority': {'type': 'number'},
+                    'honourlimits': {'type': 'boolean'},
+                    'include_files': one_or_more({'type': 'string'}),
+                    'skip_files': one_or_more({'type': 'string'}),
+                    'rename_like_files': {'type': 'boolean'}
+                },
+                'additionalProperties': False
+            }
+        ]
+    }
 
     def prepare_config(self, config):
         config = TransmissionBase.prepare_config(self, config)
-        config.setdefault('removewhendone', False)
+        config.setdefault('path', '')
+        config.setdefault('main_file_only', False)
+        config.setdefault('magnetization_timeout', 0)
+        config.setdefault('include_subs', False)
+        config.setdefault('rename_like_files', False)
+        config.setdefault('include_files', [])
         return config
-
-    @priority(120)
+        
+    @plugin.priority(120)
     def on_task_download(self, task, config):
         """
             Call download plugin to generate the temp files we will load
@@ -218,49 +281,47 @@ class PluginTransmission(TransmissionBase):
             return
         # If the download plugin is not enabled, we need to call it to get
         # our temp .torrent files
-        if not 'download' in task.config:
-            download = get_plugin_by_name('download')
+        if 'download' not in task.config:
+            download = plugin.get_plugin_by_name('download')
             download.instance.get_temp_files(task, handle_magnets=True, fail_html=True)
 
-    @priority(135)
+    @plugin.priority(135)
     @save_opener
     def on_task_output(self, task, config):
         from transmissionrpc import TransmissionError
         config = self.prepare_config(config)
         # don't add when learning
-        if task.manager.options.learn:
+        if task.options.learn:
             return
         if not config['enabled']:
             return
         # Do not run if there is nothing to do
-        if not task.accepted and not config['removewhendone']:
+        if not task.accepted:
             return
         if self.client is None:
             self.client = self.create_rpc_client(config)
             if self.client:
                 log.debug('Successfully connected to transmission.')
             else:
-                raise PluginError("Couldn't connect to transmission.")
+                raise plugin.PluginError("Couldn't connect to transmission.")
         if task.accepted:
             self.add_to_transmission(self.client, task, config)
-        if config['removewhendone']:
-            try:
-                self.remove_finished(self.client)
-            except TransmissionError as e:
-                log.error('Error while attempting to remove completed torrents from transmission: %s' % e)
 
     def _make_torrent_options_dict(self, config, entry):
 
         opt_dic = {}
 
-        for opt_key in ('path', 'addpaused', 'honourlimits', 'bandwidthpriority',
-                        'maxconnections', 'maxupspeed', 'maxdownspeed', 'ratio'):
+        for opt_key in ('path', 'addpaused', 'honourlimits', 'bandwidthpriority', 'maxconnections', 'maxupspeed', 
+                        'maxdownspeed', 'ratio', 'main_file_only', 'main_file_ratio', 'magnetization_timeout',
+                        'include_subs', 'content_filename', 'include_files', 'skip_files', 'rename_like_files'):
+            # Values do not merge config with task
+            # Task takes priority then config is used
             if opt_key in entry:
                 opt_dic[opt_key] = entry[opt_key]
-            elif opt_key in config:
+            elif opt_key in config:                
                 opt_dic[opt_key] = config[opt_key]
 
-        options = {'add': {}, 'change': {}}
+        options = {'add': {}, 'change': {}, 'post': {}}
 
         add = options['add']
         if opt_dic.get('path'):
@@ -269,12 +330,12 @@ class PluginTransmission(TransmissionBase):
                 add['download_dir'] = pathscrub(path).encode('utf-8')
             except RenderError as e:
                 log.error('Error setting path for %s: %s' % (entry['title'], e))
-        if 'addpaused' in opt_dic:
-            add['paused'] = opt_dic['addpaused']
         if 'bandwidthpriority' in opt_dic:
             add['bandwidthPriority'] = opt_dic['bandwidthpriority']
         if 'maxconnections' in opt_dic:
             add['peer_limit'] = opt_dic['maxconnections']
+        # make sure we add it paused, will modify status after adding
+        add['paused'] = True
 
         change = options['change']
         if 'honourlimits' in opt_dic and not opt_dic['honourlimits']:
@@ -297,21 +358,44 @@ class PluginTransmission(TransmissionBase):
             else:
                 change['seedRatioMode'] = 1
 
+        post = options['post']
+        # set to modify paused status after 
+        if 'addpaused' in opt_dic:
+            post['paused'] = opt_dic['addpaused']
+        if 'main_file_only' in opt_dic:
+            post['main_file_only'] = opt_dic['main_file_only']
+        if 'main_file_ratio' in opt_dic:
+            post['main_file_ratio'] = opt_dic['main_file_ratio']
+        if 'magnetization_timeout' in opt_dic:
+            post['magnetization_timeout'] = opt_dic['magnetization_timeout']
+        if 'include_subs' in opt_dic:
+            post['include_subs'] = opt_dic['include_subs']
+        if 'content_filename' in opt_dic:
+            try:
+                post['content_filename'] = entry.render(opt_dic['content_filename'])
+            except RenderError as e:
+                log.error('Unable to render content_filename %s: %s' % (entry['title'], e))
+        if 'skip_files' in opt_dic:
+            post['skip_files'] = opt_dic['skip_files']
+        if 'include_files' in opt_dic:
+            post['include_files'] = opt_dic['include_files']
+        if 'rename_like_files' in opt_dic:
+            post['rename_like_files'] = opt_dic['rename_like_files']
         return options
 
     def add_to_transmission(self, cli, task, config):
         """Adds accepted entries to transmission """
         from transmissionrpc import TransmissionError
         for entry in task.accepted:
-            if task.manager.options.test:
+            if task.options.test:
                 log.info('Would add %s to transmission' % entry['url'])
                 continue
+            # Compile user options into appripriate dict
             options = self._make_torrent_options_dict(config, entry)
-
             downloaded = not entry['url'].startswith('magnet:')
 
             # Check that file is downloaded
-            if downloaded and not 'file' in entry:
+            if downloaded and 'file' not in entry:
                 entry.fail('file missing?')
                 continue
 
@@ -326,16 +410,177 @@ class PluginTransmission(TransmissionBase):
             try:
                 if downloaded:
                     with open(entry['file'], 'rb') as f:
-                        filedump = base64.encodestring(f.read())
-                    r = cli.add(filedump, 30, **options['add'])
+                        filedump = base64.b64encode(f.read()).encode('utf-8')
+                    r = cli.add_torrent(filedump, 30, **options['add'])
                 else:
-                    r = cli.add_uri(entry['url'], timeout=30, **options['add'])
+                    # we need to set paused to false so the magnetization begins immediately
+                    options['add']['paused'] = False
+                    r = cli.add_torrent(entry['url'], timeout=30, **options['add'])
                 if r:
-                    torrent = r.values()[0]
+                    torrent = r
                 log.info('"%s" torrent added to transmission' % (entry['title']))
+
+                total_size = cli.get_torrent(r.id, ['id', 'totalSize']).totalSize
+
+                def _filter_list(list):
+                    for item in list:
+                            if not isinstance(item, basestring):
+                                list.remove(item)
+                    return list
+
+                def _find_matches(name, list):
+                    for mask in list:
+                        if fnmatch(name, mask):
+                            return True
+                    return False
+                
+                def _wait_for_files(cli, r, timeout):
+                    from time import sleep
+                    while timeout > 0:
+                        sleep(1)
+                        fl = cli.get_files(r.id)
+                        if len(fl[r.id]) > 0:
+                            return fl
+                        else:
+                            timeout -= 1
+                    return fl
+
+                skip_files = False
+                # Filter list because "set" plugin doesn't validate based on schema
+                # Skip files only used if we have no main file
+                if 'skip_files' in options['post']:
+                    skip_files = True
+                    options['post']['skip_files'] = _filter_list(options['post']['skip_files'])
+                
+                main_id = None       
+                # We need to index the files if any of the following are defined
+                if ('main_file_only' in options['post'] and options['post']['main_file_only'] == True or 
+                   'content_filename' in options['post'] or skip_files):
+                        fl = cli.get_files(r.id)
+                
+                        if 'magnetization_timeout' in options['post'] and options['post']['magnetization_timeout'] > 0 and not downloaded and len(fl[r.id]) == 0:
+                            log.debug('Waiting %d seconds for "%s" to magnetize' % (options['post']['magnetization_timeout'], entry['title']))
+                            fl = _wait_for_files(cli, r, options['post']['magnetization_timeout'])
+                            if len(fl[r.id]) == 0:
+                                log.warning('"%s" did not magnetize before the timeout elapsed, file list unavailable for processing.' % entry['title'])
+                            else:
+                                total_size = cli.get_torrent(r.id, ['id', 'totalSize']).totalSize
+                
+                        # Find files based on config
+                        dl_list = []
+                        skip_list = []
+                        main_list = []
+                        full_list = []
+                        ext_list = ['*.srt', '*.sub', '*.idx', '*.ssa', '*.ass']
+                        
+                        main_ratio = config['main_file_ratio']
+                        if 'main_file_ratio' in options['post']:
+                            main_ratio = options['post']['main_file_ratio']
+                                              
+                        if 'include_files' in options['post']:                
+                            include_files = True
+                            options['post']['include_files'] = _filter_list(options['post']['include_files'])
+
+                        for f in fl[r.id]:
+                            full_list.append(f)
+                            if fl[r.id][f]['size'] > total_size * main_ratio:
+                                main_id = f
+
+                            if 'include_files' in options['post']:
+                                if _find_matches(fl[r.id][f]['name'], options['post']['include_files']):
+                                    dl_list.append(f)
+                                elif ('include_subs' in options['post'] and options['post']['include_subs'] == True and
+                                      _find_matches(fl[r.id][f]['name'], ext_list)):
+                                        dl_list.append(f)
+                                    
+                            if skip_files:
+                                if _find_matches(fl[r.id][f]['name'], options['post']['skip_files']):
+                                    skip_list.append(f)      
+
+                        if main_id is not None:
+                            
+                            # Look for files matching main ID title but with a different extension
+                            if 'rename_like_files' in options['post'] and options['post']['rename_like_files'] == True:
+                                for f in fl[r.id]:
+                                    # if this filename matches main filename we want to rename it as well
+                                    fs = os.path.splitext(fl[r.id][f]['name'])
+                                    if fs[0] == os.path.splitext(fl[r.id][main_id]['name'])[0]:
+                                        main_list.append(f)
+                            else:
+                                main_list = [main_id]
+         
+                            if main_id not in dl_list:
+                                dl_list.append(main_id)
+                        else:
+                            log.warning('No files in "%s" are > %d%% of content size, no files renamed.' % (entry['title'], main_ratio * 100))
+
+                        # If we have a main file and want to rename it and associated files
+                        if 'content_filename' in options['post'] and main_id is not None:
+                            download_dir = ""
+                            if 'download_dir' not in options['add']:
+                                download_dir = cli.get_session().download_dir
+                            else:
+                                download_dir = options['add']['download_dir']
+
+                            # Get new filename without ext
+                            file_ext = os.path.splitext(fl[r.id][main_id]['name'])[1]
+                            file_path = os.path.dirname(os.path.join(download_dir, fl[r.id][main_id]['name']))
+                            filename = options['post']['content_filename']
+                            if config['host'] == 'localhost' or config['host'] == '127.0.0.1':
+                                counter = 1
+                                while os.path.exists(os.path.join(file_path, filename + file_ext)):
+                                    # Try appending a (#) suffix till a unique filename is found
+                                    filename = '%s(%s)' % (options['post']['content_filename'], counter)
+                                    counter += 1
+                            else:
+                                log.debug('Cannot ensure content_filename is unique '
+                                'when adding to a remote transmission daemon.')
+                        
+                            for index in main_list:
+                                file_ext = os.path.splitext(fl[r.id][index]['name'])[1]
+                                log.debug('File %s renamed to %s' % (fl[r.id][index]['name'], filename + file_ext))
+                        # change to below when set_files will allow setting name, more efficient to have one call
+                        # fl[r.id][index]['name'] = os.path.basename(pathscrub(filename + file_ext).encode('utf-8'))
+                                try:
+                                    cli.rename_torrent_path(r.id, fl[r.id][index]['name'],
+                                                            os.path.basename(
+                                                                pathscrub(filename + file_ext).encode('utf-8'))
+                                                            )
+                                except TransmissionError:
+                                    log.error('content_filename only supported with transmission 2.8+')
+
+                        if ('main_file_only' in options['post'] and options['post']['main_file_only'] == True and
+                           main_id is not None):
+                            # Set Unwanted Files
+                            options['change']['files_unwanted'] = [x for x in full_list if x not in dl_list]
+                            options['change']['files_wanted'] = dl_list
+                            log.debug('Downloading %s of %s files in torrent.' % 
+                                      (len(options['change']['files_wanted']), len(full_list)))
+                        elif(('main_file_only' not in options['post'] or 
+                              options['post']['main_file_only'] == False or
+                              main_id is None) and
+                             skip_files):
+                                # If no main file and we want to skip files
+
+                                if len(skip_list) >= len(full_list):
+                                    log.debug('skip_files filter would cause no files to be downloaded; '
+                                    'including all files in torrent.')
+                                else:
+                                    options['change']['files_unwanted'] = skip_list           
+                                    options['change']['files_wanted'] = [x for x in full_list if x not in skip_list]
+                                    log.debug('Downloading %s of %s files in torrent.' 
+                                              % (len(options['change']['files_wanted']), len(full_list)))
+                
+                # Set any changed file properties
                 if options['change'].keys():
-                    for id in r.keys():
-                        cli.change(id, 30, **options['change'])
+                    cli.change_torrent(r.id, 30, **options['change'])
+                           
+                # if addpaused was defined and set to False start the torrent;
+                # prevents downloading data before we set what files we want
+                if ('paused' in options['post'] and options['post']['paused'] == False or
+                   'paused' not in options['post'] and cli.get_session().start_added_torrents == True):
+                        cli.start_torrent(r.id)
+
             except TransmissionError as e:
                 log.debug('TransmissionError', exc_info=True)
                 log.debug('Failed options dict: %s' % options)
@@ -343,29 +588,102 @@ class PluginTransmission(TransmissionBase):
                 log.error(msg)
                 entry.fail(msg)
 
-    def remove_finished(self, cli):
-        # Get a list of active transfers
-        transfers = cli.info(arguments=['id', 'hashString', 'name', 'status', 'uploadRatio', 'seedRatioLimit'])
-        remove_ids = []
-        # Go through the list of active transfers and add finished transfers to remove_ids.
-        for transfer in transfers.itervalues():
-            log.debug('Transfer "%s": status: "%s" upload ratio: %.2f seed ratio: %.2f' %
-                      (transfer.name, transfer.status, transfer.uploadRatio, transfer.seedRatioLimit))
-            if transfer.status == 'stopped' and transfer.uploadRatio >= transfer.seedRatioLimit:
-                log.info('Removing finished torrent `%s` from transmission' % transfer.name)
-                remove_ids.append(transfer.id)
-        # Remove finished transfers
-        if remove_ids:
-            cli.remove(remove_ids)
-
     def on_task_exit(self, task, config):
         """Make sure all temp files are cleaned up when task exits"""
         # If download plugin is enabled, it will handle cleanup.
-        if not 'download' in task.config:
-            download = get_plugin_by_name('download')
+        if 'download' not in task.config:
+            download = plugin.get_plugin_by_name('download')
             download.instance.cleanup_temp_files(task)
 
     on_task_abort = on_task_exit
 
-register_plugin(PluginTransmission, 'transmission', api_ver=2)
-register_plugin(PluginTransmissionInput, 'from_transmission', api_ver=2)
+
+class PluginTransmissionClean(TransmissionBase):
+    """
+    Remove completed torrents from Transmission.
+    
+    Examples::
+      
+      clean_transmission: yes  # ignore both time and ratio
+
+      clean_transmission:      # uses transmission's internal limits for idle time and seed ratio ( if defined )
+        transmission_seed_limits: yes
+      
+      clean_transmission:      # matches time only
+        finished_for: 2 hours
+      
+      clean_transmission:      # matches ratio only
+        min_ratio: 0.5
+      
+      clean_transmission:      # matches time OR ratio
+        finished_for: 2 hours
+        min_ratio: 0.5
+    
+    Default values for the config elements::
+    
+      clean_transmission:
+        host: localhost
+        port: 9091
+        enabled: yes
+    """
+
+    def validator(self):
+        """Return config validator"""
+        root = validator.factory()
+        root.accept('boolean')
+        advanced = root.accept('dict')
+        self._validator(advanced)
+        advanced.accept('number', key='min_ratio')
+        advanced.accept('interval', key='finished_for')
+        advanced.accept('boolean', key='transmission_seed_limits')
+        advanced.accept('boolean', key='delete_files')
+        return root
+    
+    def on_task_exit(self, task, config):
+        config = self.prepare_config(config)
+        if not config['enabled'] or task.options.learn:
+            return
+        if not self.client:
+            self.client = self.create_rpc_client(config)
+        nrat = float(config['min_ratio']) if 'min_ratio' in config else None
+        nfor = parse_timedelta(config['finished_for']) if 'finished_for' in config else None
+        delete_files = bool(config['delete_files']) if 'delete_files' in config else False
+        trans_checks = bool(config['transmission_seed_limits']) if 'transmission_seed_limits' in config else False
+        
+        session = self.client.get_session()
+
+        remove_ids = []
+        for torrent in self.client.get_torrents():
+            log.verbose('Torrent "%s": status: "%s" - ratio: %s -  date added: %s - date done: %s' %
+                        (torrent.name, torrent.status, torrent.ratio, torrent.date_added, torrent.date_done))
+            downloaded, dummy = self.torrent_info(torrent, config)
+            seed_ratio_ok, idle_limit_ok = self.check_seed_limits(torrent, session)
+            is_clean_all= nrat is None and nfor is None and trans_checks is None
+            is_minratio_reached= nrat and (nrat <= torrent.ratio)
+            is_transmission_seedlimit_unset = trans_checks and seed_ratio_ok is None and idle_limit_ok is None
+            is_transmission_seedlimit_reached = trans_checks and seed_ratio_ok is True
+            is_transmission_idlelimit_reached = trans_checks and idle_limit_ok is True
+            is_torrent_seed_only = torrent.date_done <= torrent.date_added
+            is_torrent_idlelimit_since_added_reached = nfor and (torrent.date_added + nfor)  <= datetime.now()
+            is_torrent_idlelimit_since_finished_reached = nfor and (torrent.date_done + nfor)  <= datetime.now()
+            if (downloaded and (is_clean_all or
+                                is_transmission_seedlimit_unset or
+                                is_transmission_seedlimit_reached or
+                                is_transmission_idlelimit_reached or
+                                is_minratio_reached or
+                                     (is_torrent_seed_only and is_torrent_idlelimit_since_added_reached) or
+                                     (not is_torrent_seed_only and is_torrent_idlelimit_since_finished_reached))):
+                if task.options.test:
+                    log.info('Would remove finished torrent `%s` from transmission' % torrent.name)
+                    continue
+                log.info('Removing finished torrent `%s` from transmission' % torrent.name)
+                remove_ids.append(torrent.id)
+        if remove_ids:
+            self.client.remove_torrent(remove_ids, delete_files)
+
+
+@event('plugin.register')
+def register_plugin():
+    plugin.register(PluginTransmission, 'transmission', api_ver=2)
+    plugin.register(PluginTransmissionInput, 'from_transmission', api_ver=2)
+    plugin.register(PluginTransmissionClean, 'clean_transmission', api_ver=2)

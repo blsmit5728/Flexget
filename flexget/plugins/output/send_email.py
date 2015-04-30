@@ -7,75 +7,44 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from smtplib import SMTPException
 from email.utils import formatdate
-from flexget.utils.tools import MergeException, merge_dict_from_to
-from flexget.plugin import PluginError, register_plugin
-from flexget import manager
+
+from flexget import config_schema, manager, plugin
 from flexget.event import event
 from flexget.utils.template import render_from_task, get_template, RenderError
+from flexget.utils.tools import merge_dict_from_to, MergeException
 from flexget import validator
+from flexget.config_schema import one_or_more
 
 log = logging.getLogger('email')
 
 # A dict which stores the email content from each task when plugin is configured globally
 task_content = {}
 
-
-def options_validator():
-    email = validator.factory('dict')
-    email.accept('boolean', key='active')
-    email.accept('text', key='to', required=True)
-    email.accept('list', key='to', required=True).accept('text')
-    email.accept('text', key='from', required=True)
-    email.accept('text', key='smtp_host')
-    email.accept('integer', key='smtp_port')
-    email.accept('boolean', key='smtp_login')
-    email.accept('text', key='smtp_username')
-    email.accept('text', key='smtp_password')
-    email.accept('boolean', key='smtp_tls')
-    email.accept('boolean', key='smtp_ssl')
-    email.accept('text', key='template')
-    email.accept('text', key='subject')
-    return email
-
-
 def prepare_config(config):
-    config.setdefault('active', True)
-    config.setdefault('smtp_host', 'localhost')
-    config.setdefault('smtp_port', 25)
-    config.setdefault('smtp_login', False)
-    config.setdefault('smtp_username', '')
-    config.setdefault('smtp_password', '')
-    config.setdefault('smtp_tls', False)
-    config.setdefault('smtp_ssl', False)
-    config.setdefault('template', 'default.template')
     if not isinstance(config['to'], list):
         config['to'] = [config['to']]
     return config
 
-
 @event('manager.execute.started')
-def setup(manager):
+def setup(manager, options):
     if not 'email' in manager.config:
         return
     config = prepare_config(manager.config['email'])
     config['global'] = True
     global task_content
     task_content = {}
-    for task in manager.tasks.itervalues():
-        task.config.setdefault('email', {})
+    for task_name, task_config in manager.config['tasks'].iteritems():
+        task_config.setdefault('email', {})
         try:
-            merge_dict_from_to(config, task.config['email'])
+            merge_dict_from_to(config, task_config['email'])
         except MergeException as exc:
-            raise PluginError('Failed to merge email config to task %s due to %s' % (task.name, exc))
-        task.config.setdefault('email', config)
+            raise plugin.PluginError('Failed to merge email config to task %s due to %s' % (task_name, exc))
+        task_config.setdefault('email', config)
 
 
 @event('manager.execute.completed')
-def global_send(manager):
+def global_send(manager, options):
     if not 'email' in manager.config:
-        return
-    if all(not task.enabled for task in manager.tasks.itervalues()):
-        # If all the tasks are disabled, don't do anything.
         return
     config = prepare_config(manager.config['email'])
     content = ''
@@ -117,7 +86,8 @@ def send_email(subject, content, config):
         try:
             if config['smtp_ssl']:
                 if sys.version_info < (2, 6, 3):
-                    raise PluginError('SSL email support requires python >= 2.6.3 due to python bug #4066, upgrade python or use TLS', log)
+                    raise plugin.PluginError('SSL email support requires python >= 2.6.3 due to python bug #4066, '
+                                             'upgrade python or use TLS', log)
                     # Create a SSL connection to smtp server
                 mailServer = smtplib.SMTP_SSL(config['smtp_host'], config['smtp_port'])
             else:
@@ -137,7 +107,8 @@ def send_email(subject, content, config):
         try:
 
             if config.get('smtp_username') and config.get('smtp_password'):
-                mailServer.login(config['smtp_username'], config['smtp_password'])
+                # Forcing to use `str` type
+                mailServer.login(str(config['smtp_username']), str(config['smtp_password']))
             mailServer.sendmail(message['From'], config['to'], message.as_string())
         except IOError as e:
             # Ticket #686
@@ -235,24 +206,35 @@ class OutputEmail(object):
         smtp_ssl: False
     """
 
-    def validator(self):
-        v = options_validator()
-        v.accept('boolean', key='global')
-        return v
+    schema = {
+        'type': 'object',
+        'properties': {
+            'active': {'type': 'boolean', 'default': True},
+            'to': one_or_more({'type': 'string'}),
+            'from': {'type': 'string'},
+            'smtp_host': {'type': 'string', 'default': 'localhost'},
+            'smtp_port': {'type': 'integer', 'default': 25},
+            'smtp_login': {'type': 'boolean', 'default': False},
+            'smtp_username': {'type': 'string', 'default': ''},
+            'smtp_password': {'type': 'string', 'default': ''},
+            'smtp_tls': {'type': 'boolean', 'default': False},
+            'smtp_ssl': {'type': 'boolean', 'default': False},
+            'template': {'type': 'string', 'default': 'default.template'},
+            'subject': {'type': 'string'},
+            'global': {'type': 'boolean'}
+        },
+        'required': ['to', 'from'],
+        'additionalProperties': False,
+    }
 
+    @plugin.priority(0)
     def on_task_output(self, task, config):
-        """Count the email as an output"""
-
-    def on_task_exit(self, task, config):
-        """Send email at exit."""
-
         config = prepare_config(config)
-
         if not config['active']:
             return
 
         # don't send mail when learning
-        if task.manager.options.learn:
+        if task.options.learn:
             return
 
         # generate email content
@@ -288,15 +270,16 @@ class OutputEmail(object):
         else:
             send_email(subject, content, config)
 
-    # Also send the email on abort
     def on_task_abort(self, task, config):
-        # The config may not be correct if the task is aborting
-        try:
-            self.on_task_exit(task, config)
-        except Exception as e:
-            log.info('Could not send abort email because email config is invalid.')
-            # Log the exception to debug, in case something different is going wrong.
-            log.debug('Email error:', exc_info=True)
+        if not task.silent_abort:
+            self.on_task_output(task, config)
 
-register_plugin(OutputEmail, 'email', api_ver=2)
-manager.register_config_key('email', options_validator().schema())
+
+@event('plugin.register')
+def register_plugin():
+    plugin.register(OutputEmail, 'email', api_ver=2)
+
+
+@event('config.register')
+def register_config_key():
+    config_schema.register_config_key('email', OutputEmail.schema)

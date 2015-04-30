@@ -38,6 +38,8 @@ How do I get started?
 Set up development environment, which is basically just two steps.
 
 #. `GIT clone`_ our repository.
+#. - Either the wheel package of `setuptools`_ and `pip`_ need to be in the directory with bootstrap.py
+   - Or `virtualenv`_ package needs to be installed.
 #. Run ``bootstrap.py`` with Python 2.6.x - 2.7.x.
 
 For easier collaboration we recommend forking us on github and sending pull
@@ -48,6 +50,9 @@ if you wish.
 If you are new to Git there are several interactive tutorials you can try to get
 you started including `tryGit`_ and `LearnGitBranching`_.
 
+.. _setuptools: https://pypi.python.org/pypi/setuptools
+.. _pip: https://pypi.python.org/pypi/pip
+.. _virtualenv: https://pypi.python.org/pypi/virtualenv
 .. _GIT clone: https://github.com/Flexget/Flexget
 .. _tryGit: http://try.github.io
 .. _LearnGitBranching: http://pcottle.github.io/learnGitBranching/
@@ -63,6 +68,10 @@ activated. If you don't activate it you must run commands explicitly from under
 environment ``bin`` directory or ``scripts`` in windows. E.g. ``flexget`` would
 be ``bin/flexget`` (at project root) in unactivated `virtual environment`_.
 
+How to activate virtualenv under linux::
+
+  source bin/activate
+
 FlexGet project uses `paver`_ to provide development related utilities and tasks.
 Run ``paver --help`` to see what commands are available. Some of these will
 be mentioned later.
@@ -77,7 +86,10 @@ Unit tests
 ~~~~~~~~~~
 
 There are currently over 250 unit tests ensuring that existing functionality
-is not accidentally broken.
+is not accidentally broken. Unit tests can be invoked with the installation
+of additionnal requirments:
+
+  pip install jenkins-requirements.txt
 
 Easiest way to run tests is trough paver::
 

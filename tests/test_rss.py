@@ -1,13 +1,13 @@
 from __future__ import unicode_literals, division, absolute_import
 import yaml
-from tests import FlexGetBase
-from nose.plugins.attrib import attr
+
+from tests import FlexGetBase, use_vcr
 
 
 class TestInputRSS(FlexGetBase):
 
     __yaml__ = """
-        presets:
+        templates:
           global:
             rss:
               url: rss.xml
@@ -34,30 +34,30 @@ class TestInputRSS(FlexGetBase):
           test_all_entries_yes:
             rss:
               all_entries: yes
+          test_field_sanitation:
+            rss:
+              link: "other:link"
+              title: "other:Title"
+              other_fields:
+              - "Other:field"
     """
-
-    def setup(self):
-        FlexGetBase.setup(self)
-        # reset input cache so that the cache is not used for second execution
-        from flexget.utils.cached_input import cached
-        cached.cache = {}
 
     def test_rss(self):
         self.execute_task('test')
 
         # normal entry
-        assert self.task.find_entry(title='Normal', url='http://localhost/normal', \
+        assert self.task.find_entry(title='Normal', url='http://localhost/normal',
                                     description='Description, normal'), \
             'RSS entry missing: normal'
 
         # multiple enclosures
-        assert self.task.find_entry(title='Multiple enclosures', url='http://localhost/enclosure1', \
+        assert self.task.find_entry(title='Multiple enclosures', url='http://localhost/enclosure1',
                                     filename='enclosure1', description='Description, multiple'), \
             'RSS entry missing: enclosure1'
-        assert self.task.find_entry(title='Multiple enclosures', url='http://localhost/enclosure2', \
+        assert self.task.find_entry(title='Multiple enclosures', url='http://localhost/enclosure2',
                                     filename='enclosure2', description='Description, multiple'), \
             'RSS entry missing: enclosure2'
-        assert self.task.find_entry(title='Multiple enclosures', url='http://localhost/enclosure3', \
+        assert self.task.find_entry(title='Multiple enclosures', url='http://localhost/enclosure3',
                                     filename='enclosure3', description='Description, multiple'), \
             'RSS entry missing: enclosure3'
 
@@ -74,7 +74,7 @@ class TestInputRSS(FlexGetBase):
         assert e['filename'] == 'enclosure.mp3', 'Messy RSS enclosure: wrong filename'
 
         # pick link from guid
-        assert self.task.find_entry(title='Guid link', url='http://localhost/guid', \
+        assert self.task.find_entry(title='Guid link', url='http://localhost/guid',
                                     description='Description, guid'), \
                                     'RSS entry missing: guid'
 
@@ -111,7 +111,7 @@ class TestInputRSS(FlexGetBase):
 
     def test_multiple_links(self):
         self.execute_task('test_multiple_links')
-        entry = self.task.find_entry(title='Guid link', url='http://localhost/guid', \
+        entry = self.task.find_entry(title='Guid link', url='http://localhost/guid',
                                     description='Description, guid')
         assert entry['urls'] == ['http://localhost/guid', 'http://localhost/otherlink'], \
             'Failed to set urls with both links'
@@ -119,6 +119,9 @@ class TestInputRSS(FlexGetBase):
     def test_all_entries_no(self):
         self.execute_task('test_all_entries_no')
         assert self.task.entries, 'Entries should have been produced on first run.'
+        # reset input cache so that the cache is not used for second execution
+        from flexget.utils.cached_input import cached
+        cached.cache.clear()
         self.execute_task('test_all_entries_no')
         assert not self.task.entries, 'No entries should have been produced the second run.'
 
@@ -127,6 +130,13 @@ class TestInputRSS(FlexGetBase):
         assert self.task.entries, 'Entries should have been produced on first run.'
         self.execute_task('test_all_entries_yes')
         assert self.task.entries, 'Entries should have been produced on second run.'
+
+    def test_field_sanitation(self):
+        self.execute_task('test_field_sanitation')
+        entry = self.task.entries[0]
+        assert entry['title'] == 'alt title'
+        assert entry['url'] == 'http://localhost/altlink'
+        assert entry['other:field'] == 'otherfield'
 
 
 class TestRssOnline(FlexGetBase):
@@ -153,7 +163,7 @@ class TestRssOnline(FlexGetBase):
 
     """
 
-    @attr(online=True)
+    @use_vcr
     def test_rss_online(self):
         # Make sure entries are created for all test tasks
         tasks = yaml.load(self.__yaml__)['tasks']

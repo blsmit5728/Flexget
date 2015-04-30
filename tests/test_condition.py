@@ -5,9 +5,9 @@ from tests import FlexGetBase
 class TestCondition(FlexGetBase):
 
     __yaml__ = """
-        presets:
+        templates:
           global:
-            disable_builtins: [seen]
+            disable: [seen]
             mock:
               - {title: 'test', year: 2000}
               - {title: 'brilliant', rating: 9.9}
@@ -72,9 +72,9 @@ class TestCondition(FlexGetBase):
 class TestQualityCondition(FlexGetBase):
 
     __yaml__ = """
-        presets:
+        templates:
           global:
-            disable_builtins: [seen]
+            disable: [seen]
             mock:
               - {title: 'Smoke.1280x720'}
               - {title: 'Smoke.720p'}

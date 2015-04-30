@@ -1,8 +1,7 @@
 from __future__ import unicode_literals, division, absolute_import
 import os
 
-from nose.plugins.attrib import attr
-from tests import FlexGetBase, with_filecopy
+from tests import FlexGetBase, with_filecopy, use_vcr
 from flexget.utils.bittorrent import Torrent
 
 
@@ -14,6 +13,12 @@ class TestInfoHash(FlexGetBase):
             mock:
               - {title: 'test', file: 'test.torrent'}
             accept_all: yes
+          test_magnet:
+            mock:
+              - title: test magnet
+                url: magnet:?xt=urn:btih:2a8959bed2be495bb0e3ea96f497d873d5faed05&dn=some.thing.720p
+              - title: test magnet 2
+                urls: ['magnet:?xt=urn:btih:2b3959bed2be445bb0e3ea96f497d873d5faed05&dn=some.thing.else.720p']
     """
 
     def test_infohash(self):
@@ -22,6 +27,12 @@ class TestInfoHash(FlexGetBase):
         info_hash = self.task.entries[0].get('torrent_info_hash')
         assert info_hash == '14FFE5DD23188FD5CB53A1D47F1289DB70ABF31E', \
             'InfoHash does not match (got %s)' % info_hash
+
+    def test_magnet_infohash(self):
+        """Tests metainfo/magnet_btih plugin"""
+        self.execute_task('test_magnet')
+        assert self.task.all_entries[0]['torrent_info_hash'] == '2A8959BED2BE495BB0E3EA96F497D873D5FAED05'
+        assert self.task.all_entries[1]['torrent_info_hash'] == '2B3959BED2BE445BB0E3EA96F497D873D5FAED05'
 
 
 class TestSeenInfoHash(FlexGetBase):
@@ -60,7 +71,7 @@ class TestSeenInfoHash(FlexGetBase):
 class TestModifyTrackers(FlexGetBase):
 
     __yaml__ = """
-        presets:
+        templates:
           global:
             accept_all: yes
         tasks:
@@ -158,7 +169,7 @@ class TestTorrentScrub(FlexGetBase):
               - {title: 'LICENSE-resume', file: '__tmp__LICENSE-resume.torrent'}
             accept_all: yes
             torrent_scrub: all
-            disable_builtins: [seen_info_hash]
+            disable: [seen_info_hash]
 
           test_fields:
             mock:
@@ -255,7 +266,7 @@ class TestTorrentScrub(FlexGetBase):
 
 class TestTorrentAlive(FlexGetBase):
     __yaml__ = """
-        presets:
+        templates:
           global:
             accept_all: yes
         tasks:
@@ -269,7 +280,7 @@ class TestTorrentAlive(FlexGetBase):
             torrent_alive: 0
     """
 
-    @attr(online=True)
+    @use_vcr
     @with_filecopy('test.torrent', 'test_torrent_alive.torrent')
     def test_torrent_alive_fail(self):
         self.execute_task('test_torrent_alive_fail')
@@ -282,14 +293,14 @@ class TestTorrentAlive(FlexGetBase):
         assert not self.task.accepted, 'Torrent should have been rejected by remember_rejected.'
         assert self.task._rerun_count == 0, 'Task should not have been rerun.'
 
-    @attr(online=True)
+    @use_vcr
     @with_filecopy('test.torrent', 'test_torrent_alive.torrent')
     def test_torrent_alive_pass(self):
         self.execute_task('test_torrent_alive_pass')
         assert self.task.accepted
         assert self.task._rerun_count == 0, 'Torrent should have been accepted without rerun.'
 
-    @attr(online=True)
+    @use_vcr
     def test_torrent_alive_udp_invalid_port(self):
         from flexget.plugins.filter.torrent_alive import get_udp_seeds
         assert get_udp_seeds('udp://[2001::1]/announce','HASH') == 0

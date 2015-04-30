@@ -5,14 +5,13 @@ from datetime import datetime
 
 from sqlalchemy import Column, Integer, String, DateTime, PickleType, Index
 
-from flexget import db_schema
+from flexget import db_schema, plugin
 from flexget.entry import Entry
 from flexget.event import event
 from flexget.manager import Session
-from flexget.plugin import register_plugin, register_parser_option, priority
-from flexget.utils.database import safe_pickle_synonym
+from flexget.utils.database import safe_pickle_synonym, with_session
 from flexget.utils.sqlalchemy_utils import table_schema
-from flexget.utils.tools import parse_timedelta, console
+from flexget.utils.tools import parse_timedelta
 
 log = logging.getLogger('backlog')
 Base = db_schema.versioned_base('backlog', 1)
@@ -56,6 +55,31 @@ class BacklogEntry(Base):
 Index('ix_backlog_feed_expire', BacklogEntry.task, BacklogEntry.expire)
 
 
+@with_session
+def get_entries(task=None, session=None):
+    query = session.query(BacklogEntry)
+    if task:
+        query = query.filter(BacklogEntry.task == task)
+    return query.all()
+
+
+@with_session
+def clear_entries(task=None, all=False, session=None):
+    """
+    Clear entries from backlog.
+
+    :param task: If given, only entries from specified task will be cleared.
+    :param all: If True, all entries will be cleared, otherwise only expired entries will be cleared.
+    :returns: Number of entries cleared from backlog.
+    """
+    query = session.query(BacklogEntry)
+    if task:
+        query = query.filter(BacklogEntry.task == task)
+    if not all:
+        query = query.filter(BacklogEntry.expire < datetime.now())
+    return query.delete()
+
+
 class InputBacklog(object):
     """
     Keeps task history for given amount of time.
@@ -67,11 +91,9 @@ class InputBacklog(object):
     Rarely useful for end users, mainly used by other plugins.
     """
 
-    def validator(self):
-        from flexget import validator
-        return validator.factory('interval')
+    schema = {'type': 'string', 'format': 'interval'}
 
-    @priority(-255)
+    @plugin.priority(-255)
     def on_task_input(self, task, config):
         # Get a list of entries to inject
         injections = self.get_injections(task)
@@ -90,7 +112,8 @@ class InputBacklog(object):
             log.debug('Remembering all entries to backlog because of task abort.')
             self.learn_backlog(task)
 
-    def add_backlog(self, task, entry, amount=''):
+    @with_session
+    def add_backlog(self, task, entry, amount='', session=None):
         """Add single entry to task backlog
 
         If :amount: is not specified, entry will only be injected on next execution."""
@@ -100,7 +123,6 @@ class InputBacklog(object):
                 # Not having a snapshot is normal during input phase, don't display a warning
                 log.warning('No input snapshot available for `%s`, using current state' % entry['title'])
             snapshot = entry
-        session = Session()
         expire_time = datetime.now() + parse_timedelta(amount)
         backlog_entry = session.query(BacklogEntry).filter(BacklogEntry.title == entry['title']).\
             filter(BacklogEntry.task == task.name).first()
@@ -117,18 +139,18 @@ class InputBacklog(object):
             backlog_entry.task = task.name
             backlog_entry.expire = expire_time
             session.add(backlog_entry)
-        session.commit()
 
     def learn_backlog(self, task, amount=''):
         """Learn current entries into backlog. All task inputs must have been executed."""
-        for entry in task.entries:
-            self.add_backlog(task, entry, amount)
+        with Session() as session:
+            for entry in task.entries:
+                self.add_backlog(task, entry, amount, session=session)
 
-    def get_injections(self, task):
+    @with_session
+    def get_injections(self, task, session=None):
         """Insert missing entries from backlog."""
         entries = []
-        task_backlog = task.session.query(BacklogEntry).filter(BacklogEntry.task == task.name)
-        for backlog_entry in task_backlog.all():
+        for backlog_entry in get_entries(task=task.name, session=session):
             entry = Entry(backlog_entry.entry)
 
             # this is already in the task
@@ -140,24 +162,12 @@ class InputBacklog(object):
             log.verbose('Added %s entries from backlog' % len(entries))
 
         # purge expired
-        for backlog_entry in task_backlog.filter(datetime.now() > BacklogEntry.expire).all():
-            log.debug('Purging %s' % backlog_entry.title)
-            task.session.delete(backlog_entry)
+        purged = clear_entries(task=task.name, all=False, session=session)
+        log.debug('%s entries purged from backlog' % purged)
 
         return entries
 
 
-@event('manager.startup')
-def clear_backlog(manager):
-    if not manager.options.clear_backlog:
-        return
-    manager.disable_tasks()
-    session = Session()
-    num = session.query(BacklogEntry).delete()
-    session.close()
-    console('%s entries cleared from backlog.' % num)
-
-
-
-register_plugin(InputBacklog, 'backlog', builtin=True, api_ver=2)
-register_parser_option('--clear-backlog', action='store_true', default=False, help='Remove all items from the backlog.')
+@event('plugin.register')
+def register_plugin():
+    plugin.register(InputBacklog, 'backlog', builtin=True, api_ver=2)

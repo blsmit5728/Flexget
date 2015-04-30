@@ -1,20 +1,23 @@
 """ Plugin Loading & Management.
 """
 
-from __future__ import unicode_literals, division, absolute_import
-import sys
+from __future__ import absolute_import, division, unicode_literals
+
+import logging
 import os
 import re
-import logging
+import sys
 import time
-import pkgutil
+import warnings
 from itertools import ifilter
 
+from path import path
 from requests import RequestException
 
+from flexget import plugins as plugins_pkg
 from flexget import config_schema
 from flexget.event import add_event_handler as add_phase_handler
-from flexget import plugins as plugins_pkg
+from flexget.event import fire_event, remove_event_handlers
 
 log = logging.getLogger('plugin')
 
@@ -89,6 +92,9 @@ class PluginError(Exception):
 
     def __init__(self, value, logger=log, **kwargs):
         super(PluginError, self).__init__()
+        # Value is expected to be a string
+        if not isinstance(value, basestring):
+            value = unicode(value)
         self.value = value
         self.log = logger
         self.kwargs = kwargs
@@ -97,9 +103,10 @@ class PluginError(Exception):
         return unicode(self).encode('utf-8')
 
     def __unicode__(self):
-        return self.value
+        return unicode(self.value)
 
 
+# TODO: move to utils or somewhere more appropriate
 class internet(object):
     """@internet decorator for plugin phase methods.
 
@@ -121,21 +128,21 @@ class internet(object):
             try:
                 return func(*args, **kwargs)
             except RequestException as e:
-                log.debug('decorator caught RequestException')
+                log.debug('decorator caught RequestException. handled traceback:', exc_info=True)
                 raise PluginError('RequestException: %s' % e)
             except urllib2.HTTPError as e:
                 raise PluginError('HTTPError %s' % e.code, self.log)
             except urllib2.URLError as e:
-                log.debug('decorator caught urlerror')
+                log.debug('decorator caught urlerror. handled traceback:', exc_info=True)
                 raise PluginError('URLError %s' % e.reason, self.log)
             except BadStatusLine:
-                log.debug('decorator caught badstatusline')
+                log.debug('decorator caught badstatusline. handled traceback:', exc_info=True)
                 raise PluginError('Got BadStatusLine', self.log)
             except ValueError as e:
-                log.debug('decorator caught ValueError')
-                raise PluginError(e.message)
+                log.debug('decorator caught ValueError. handled traceback:', exc_info=True)
+                raise PluginError(e)
             except IOError as e:
-                log.debug('decorator caught ioerror')
+                log.debug('decorator caught ioerror. handled traceback:', exc_info=True)
                 if hasattr(e, 'reason'):
                     raise PluginError('Failed to reach server. Reason: %s' % e.reason, self.log)
                 elif hasattr(e, 'code'):
@@ -158,16 +165,12 @@ plugin_contexts = ['task', 'root']
 
 # task phases, in order of their execution; note that this can be extended by
 # registering new phases at runtime
-task_phases = ['start', 'input', 'metainfo', 'filter', 'download', 'modify', 'output', 'exit']
+task_phases = ['start', 'input', 'metainfo', 'filter', 'download', 'modify', 'output', 'learn', 'exit']
 
 # map phase names to method names
 phase_methods = {
     # task
-    'abort': 'on_task_abort',  # special; not a task phase that gets called normally
-
-    # lifecycle
-    'process_start': 'on_process_start',
-    'process_end': 'on_process_end',
+    'abort': 'on_task_abort'  # special; not a task phase that gets called normally
 }
 phase_methods.update((_phase, 'on_task_' + _phase) for _phase in task_phases)  # DRY
 
@@ -177,20 +180,9 @@ plugins = {}
 # Loading done?
 plugins_loaded = False
 
-_parser = None
 _loaded_plugins = {}
 _plugin_options = []
 _new_phase_queue = {}
-
-
-def register_parser_option(*args, **kwargs):
-    """Adds a parser option to the global parser."""
-    if _parser is None:
-        import warnings
-        warnings.warn('register_parser_option called before it can be')
-        return
-    _parser.add_argument(*args, **kwargs)
-    _plugin_options.append((args, kwargs))
 
 
 def register_task_phase(name, before=None, after=None):
@@ -214,11 +206,6 @@ def register_task_phase(name, before=None, after=None):
             task_phases.insert(task_phases.index(after) + 1, phase_name)
         if after is None:
             task_phases.insert(task_phases.index(before), phase_name)
-
-        # create possibly newly available phase handlers
-        for loaded_plugin in plugins:
-            plugins[loaded_plugin].build_phase_handlers()
-
         return True
 
     # if can't add yet (dependencies) queue addition
@@ -269,6 +256,10 @@ class PluginInfo(dict):
             # By default look at the containing package of the plugin.
             category = plugin_class.__module__.split('.')[-2]
 
+        # Check for unsupported api versions
+        if api_ver < 2:
+            warnings.warn('Api versions <2 are no longer supported. Plugin %s' % name, DeprecationWarning, stacklevel=2)
+
         # Set basic info attributes
         self.api_ver = api_ver
         self.name = name
@@ -279,12 +270,24 @@ class PluginInfo(dict):
         self.category = category
         self.phase_handlers = {}
 
-        # Create plugin instance
         self.plugin_class = plugin_class
+        self.instance = None
+
+        if self.name in plugins:
+            PluginInfo.dupe_counter += 1
+            log.critical('Error while registering plugin %s. A plugin with the same name is already registered' %
+                         self.name)
+        else:
+            plugins[self.name] = self
+
+    def initialize(self):
+        if self.instance is not None:
+            # We already initialized
+            return
+        # Create plugin instance
         self.instance = self.plugin_class()
         self.instance.plugin_info = self  # give plugin easy access to its own info
         self.instance.log = logging.getLogger(getattr(self.instance, "LOGGER_NAME", None) or self.name)
-
         if hasattr(self.instance, 'schema'):
             self.schema = self.instance.schema
         elif hasattr(self.instance, 'validator'):
@@ -298,13 +301,7 @@ class PluginInfo(dict):
             self.schema['id'] = location
             config_schema.register_schema(location, self.schema)
 
-        if self.name in plugins:
-            PluginInfo.dupe_counter += 1
-            log.critical('Error while registering plugin %s. %s' %
-                         (self.name, ('A plugin with the name %s is already registered' % self.name)))
-        else:
-            self.build_phase_handlers()
-            plugins[self.name] = self
+        self.build_phase_handlers()
 
     def reset_phase_handlers(self):
         """Temporary utility method"""
@@ -347,27 +344,22 @@ class PluginInfo(dict):
     __repr__ = __str__
 
 
-register_plugin = PluginInfo
+register = PluginInfo
 
 
 def _strip_trailing_sep(path):
     return path.rstrip("\\/")
 
 
-def get_standard_plugins_path():
+def _get_standard_plugins_path():
     """
     :returns: List of directories where plugins should be tried to load from.
-    :rtype: list
     """
     # Get basic path from environment
+    paths = []
     env_path = os.environ.get('FLEXGET_PLUGIN_PATH')
     if env_path:
-        # Get rid of trailing slashes, since Python can't handle them when
-        # it tries to import modules.
-        paths = map(_strip_trailing_sep, env_path.split(os.pathsep))
-    else:
-        # Use standard default
-        paths = [os.path.join(os.path.expanduser('~'), '.flexget', 'plugins')]
+        paths = env_path.split(os.pathsep)
 
     # Add flexget.plugins directory (core plugins)
     paths.append(os.path.abspath(os.path.dirname(plugins_pkg.__file__)))
@@ -380,39 +372,39 @@ def _load_plugins_from_dirs(dirs):
     """
 
     log.debug('Trying to load plugins from: %s' % dirs)
-    # add all dirs to plugins_pkg load path so that plugins are loaded from flexget and from ~/.flexget/plugins/
+    dirs = [path(d) for d in dirs if os.path.isdir(d)]
+    # add all dirs to plugins_pkg load path so that imports work properly from any of the plugin dirs
     plugins_pkg.__path__ = map(_strip_trailing_sep, dirs)
-    for importer, name, ispkg in pkgutil.walk_packages(dirs, plugins_pkg.__name__ + '.'):
-        if ispkg:
-            continue
-        # Don't load any plugins again if they are already loaded
-        # This can happen if one plugin imports from another plugin
-        if name in sys.modules:
-            continue
-        loader = importer.find_module(name)
-        # Don't load from pyc files
-        if not loader.filename.endswith('.py'):
-            continue
-        try:
-            loaded_module = loader.load_module(name)
-        except DependencyError as e:
-            if e.has_message():
-                msg = e.message
+    for plugins_dir in dirs:
+        for plugin_path in plugins_dir.walkfiles('*.py'):
+            if plugin_path.name == '__init__.py':
+                continue
+            # Split the relative path from the plugins dir to current file's parent dir to find subpackage names
+            plugin_subpackages = filter(None, plugin_path.relpath(plugins_dir).parent.splitall())
+            module_name = '.'.join([plugins_pkg.__name__] + plugin_subpackages + [plugin_path.namebase])
+            try:
+                __import__(module_name)
+            except DependencyError as e:
+                if e.has_message():
+                    msg = e.message
+                else:
+                    msg = 'Plugin `%s` requires `%s` to load.' % (e.issued_by or module_name, e.missing or 'N/A')
+                if not e.silent:
+                    log.warning(msg)
+                else:
+                    log.debug(msg)
+            except ImportError as e:
+                log.critical('Plugin `%s` failed to import dependencies' % module_name)
+                log.exception(e)
+            except ValueError as e:
+                # Debugging #2755
+                log.error('ValueError attempting to import `%s` (from %s): %s', module_name, plugin_path, e)
+            except Exception as e:
+                log.critical('Exception while loading plugin %s' % module_name)
+                log.exception(e)
+                raise
             else:
-                msg = 'Plugin `%s` requires `%s` to load.' % (e.issued_by or name, e.missing or 'N/A')
-            if not e.silent:
-                log.warning(msg)
-            else:
-                log.debug(msg)
-        except ImportError as e:
-            log.critical('Plugin `%s` failed to import dependencies' % name)
-            log.exception(e)
-        except Exception as e:
-            log.critical('Exception while loading plugin %s' % name)
-            log.exception(e)
-            raise
-        else:
-            log.trace('Loaded module %s from %s' % (name, loaded_module.__file__))
+                log.trace('Loaded module %s from %s' % (module_name, plugin_path))
 
     if _new_phase_queue:
         for phase, args in _new_phase_queue.iteritems():
@@ -420,31 +412,35 @@ def _load_plugins_from_dirs(dirs):
                       'point (before, after). Plugin is not working properly.' % (args[0], phase))
 
 
-def load_plugins(parser):
-    """Load plugins from the standard plugin paths."""
-    global plugins_loaded, _parser
+def load_plugins(extra_dirs=None):
+    """
+    Load plugins from the standard plugin paths.
+    :param list extra_dirs: Extra directories from where plugins are loaded.
+    """
+    global plugins_loaded
 
-    if plugins_loaded:
-        if parser is not None:
-            for args, kwargs in _plugin_options:
-                parser.add_argument(*args, **kwargs)
+    if not extra_dirs:
+        extra_dirs = []
 
-    # suppress DeprecationWarning's
-    import warnings
-    warnings.simplefilter('ignore', DeprecationWarning)
+    # Add flexget.plugins directory (core plugins)
+    extra_dirs.extend(_get_standard_plugins_path())
 
     start_time = time.time()
-    _parser = parser
-    try:
-        _load_plugins_from_dirs(get_standard_plugins_path())
-    finally:
-        _parser = None
+    # Import all the plugins
+    _load_plugins_from_dirs(extra_dirs)
+    # Register them
+    fire_event('plugin.register')
+    # Plugins should only be registered once, remove their handlers after
+    remove_event_handlers('plugin.register')
+    # After they have all been registered, instantiate them
+    for plugin in plugins.values():
+        plugin.initialize()
     took = time.time() - start_time
     plugins_loaded = True
     log.debug('Plugins took %.2f seconds to load' % took)
 
 
-def get_plugins(phase=None, group=None, context=None, category=None, min_api=None):
+def get_plugins(phase=None, group=None, context=None, category=None, name=None, min_api=None):
     """
     Query other plugins characteristics.
 
@@ -452,6 +448,7 @@ def get_plugins(phase=None, group=None, context=None, category=None, min_api=Non
     :param string group: Plugin must belong to this group.
     :param string context: Where plugin is configured, eg. (root, task)
     :param string category: Type of plugin, phase names.
+    :param string name: Name of the plugin.
     :param int min_api: Minimum api version.
     :return: List of PluginInfo instances.
     :rtype: list
@@ -467,6 +464,8 @@ def get_plugins(phase=None, group=None, context=None, category=None, min_api=Non
             return False
         if category and not category == plugin.category:
             return False
+        if name is not None and name != plugin.name:
+            return False
         if min_api is not None and plugin.api_ver < min_api:
             return False
         return True
@@ -477,7 +476,9 @@ def plugin_schemas(**kwargs):
     """Create a dict schema that matches plugins specified by `kwargs`"""
     return {'type': 'object',
             'properties': dict((p.name, {'$ref': p.schema['id']}) for p in get_plugins(**kwargs)),
-            'additionalProperties': False}
+            'additionalProperties': False,
+            'error_additionalProperties': '{{message}} Only known plugin names are valid keys.',
+            'patternProperties': {'^_': {'title': 'Disabled Plugin'}}}
 
 
 config_schema.register_schema('/schema/plugins', plugin_schemas)
@@ -490,6 +491,7 @@ def get_plugins_by_phase(phase):
 
     Return an iterator over all plugins that hook :phase:
     """
+    warnings.warn('Deprecated API', DeprecationWarning, stacklevel=2)
     if not phase in phase_methods:
         raise Exception('Unknown phase %s' % phase)
     return get_plugins(phase=phase)
@@ -507,6 +509,7 @@ def get_plugins_by_group(group):
 
     Return an iterator over all plugins with in specified group.
     """
+    warnings.warn('Deprecated API', DeprecationWarning, stacklevel=2)
     return get_plugins(group=group)
 
 

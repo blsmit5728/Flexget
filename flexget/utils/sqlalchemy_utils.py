@@ -3,8 +3,10 @@ Miscellaneous SQLAlchemy helpers.
 """
 from __future__ import unicode_literals, division, absolute_import
 import logging
+
+import sqlalchemy
 from sqlalchemy import ColumnDefault, Sequence, Index
-from sqlalchemy.types import AbstractType
+from sqlalchemy.types import TypeEngine
 from sqlalchemy.schema import Table, MetaData
 from sqlalchemy.exc import NoSuchTableError, OperationalError
 
@@ -21,8 +23,7 @@ def table_exists(name, session):
     :rtype: bool
     """
     try:
-        meta = MetaData(bind=session.connection())
-        Table(name, meta, autoload=True, autoload_with=session.connection())
+        table_schema(name, session)
     except NoSuchTableError:
         return False
     return True
@@ -33,10 +34,7 @@ def table_schema(name, session):
     :returns: Table schema using SQLAlchemy reflect as it currently exists in the db
     :rtype: Table
     """
-    meta = MetaData(bind=session.bind, reflect=True)
-    for table in meta.sorted_tables:
-        if table.name == name:
-            return table
+    return Table(name, MetaData(bind=session.bind), autoload=True)
 
 
 def table_columns(table, session):
@@ -72,7 +70,7 @@ def table_add_column(table, name, col_type, session, default=None):
         # If the column already exists, we don't have to do anything.
         return
     # Add the column to the table
-    if not isinstance(col_type, AbstractType):
+    if not isinstance(col_type, TypeEngine):
         # If we got a type class instead of an instance of one, instantiate it
         col_type = col_type()
     type_string = session.bind.engine.dialect.type_compiler.process(col_type)
@@ -91,7 +89,8 @@ def table_add_column(table, name, col_type, session, default=None):
 
 def drop_tables(names, session):
     """Takes a list of table names and drops them from the database if they exist."""
-    metadata = MetaData(bind=session.bind, reflect=True)
+    metadata = MetaData()
+    metadata.reflect(bind=session.bind)
     for table in metadata.sorted_tables:
         if table.name in names:
             table.drop()
@@ -125,3 +124,18 @@ def create_index(table_name, session, *column_names):
         Index(index_name, *columns).create(bind=session.bind)
     except OperationalError:
         log.debug('Error creating index.', exc_info=True)
+
+
+class ContextSession(sqlalchemy.orm.Session):
+    """:class:`sqlalchemy.orm.Session` which can be used as context manager"""
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        try:
+            if exc_type is None:
+                self.commit()
+            else:
+                self.rollback()
+        finally:
+            self.close()

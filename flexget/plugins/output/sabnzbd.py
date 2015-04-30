@@ -1,7 +1,9 @@
 from __future__ import unicode_literals, division, absolute_import
 import logging
 import urllib
-from flexget.plugin import register_plugin
+
+from flexget import plugin
+from flexget.event import event
 from flexget.utils.tools import urlopener
 
 log = logging.getLogger('sabnzbd')
@@ -26,19 +28,21 @@ class OutputSabnzbd(object):
         pp: ...
         priority: ...
     """
-
-    def validator(self):
-        from flexget import validator
-        config = validator.factory('dict')
-        config.accept('text', key='key', required=True)
-        config.accept('url', key='url', required=True)
-        config.accept('text', key='category')
-        config.accept('text', key='script')
-        config.accept('text', key='pp')
-        config.accept('integer', key='priority')
-        config.accept('text', key='password')
-        config.accept('text', key='username')
-        return config
+    schema = {
+        'type': 'object',
+        'properties': {
+            'key': {'type': 'string'},
+            'url': {'type': 'string', 'format': 'url'},
+            'category': {'type': 'string'},
+            'script': {'type': 'string'},
+            'pp': {'type': 'string'},
+            'priority': {'type': 'integer'},
+            'password': {'type': 'string'},
+            'username': {'type': 'string'},
+        },
+        'required': ['key', 'url'],
+        'additionalProperties': False,
+    }
 
     def get_params(self, config):
         params = {}
@@ -61,7 +65,7 @@ class OutputSabnzbd(object):
 
     def on_task_output(self, task, config):
         for entry in task.accepted:
-            if task.manager.options.test:
+            if task.options.test:
                 log.info('Would add into sabnzbd: %s' % entry['title'])
                 continue
 
@@ -84,7 +88,7 @@ class OutputSabnzbd(object):
                 log.critical('Failed to use sabnzbd. Requested %s' % request_url)
                 log.critical('Result was: %s' % e)
                 entry.fail('sabnzbd unreachable')
-                if task.manager.options.debug:
+                if task.options.debug:
                     log.exception(e)
                 continue
 
@@ -93,4 +97,7 @@ class OutputSabnzbd(object):
             else:
                 log.info('Added `%s` to SABnzbd' % (entry['title']))
 
-register_plugin(OutputSabnzbd, 'sabnzbd', api_ver=2)
+
+@event('plugin.register')
+def register_plugin():
+    plugin.register(OutputSabnzbd, 'sabnzbd', api_ver=2)

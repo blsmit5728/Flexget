@@ -6,7 +6,12 @@ import posixpath
 from datetime import datetime, timedelta
 import random
 
-from BeautifulSoup import BeautifulStoneSoup
+import xml.etree.ElementTree as ElementTree
+try:
+    from xml.etree.ElementTree import ParseError
+except ImportError:
+    # Python 2.6 throws this instead when there is invalid xml
+    from xml.parsers.expat import ExpatError as ParseError
 
 from sqlalchemy import Column, Integer, Float, String, Unicode, Boolean, DateTime, func
 from sqlalchemy.schema import ForeignKey
@@ -21,7 +26,7 @@ from flexget.utils.sqlalchemy_utils import table_add_column
 from flexget.manager import Session
 from flexget.utils.simple_persistence import SimplePersistence
 
-SCHEMA_VER = 2
+SCHEMA_VER = 4
 
 log = logging.getLogger('api_tvdb')
 Base = db_schema.versioned_base('api_tvdb', SCHEMA_VER)
@@ -47,6 +52,12 @@ def upgrade(ver, session):
     if ver == 1:
         table_add_column('tvdb_episodes', 'absolute_number', Integer, session)
         ver = 2
+    if ver == 2:
+        table_add_column('tvdb_series', 'overview', Unicode, session)
+        ver = 3
+    if ver == 3:
+        table_add_column('tvdb_series', 'actors', Unicode, session)
+        ver = 4
 
     return ver
 
@@ -63,10 +74,10 @@ def get_mirror(type='xml'):
             pass
         # If there were problems getting the mirror list we'll just fall back to the main site.
         if page:
-            data = BeautifulStoneSoup(page, convertEntities=BeautifulStoneSoup.HTML_ENTITIES)
-            for mirror in data.findAll('mirror'):
-                type_mask = int(mirror.typemask.string)
-                mirrorpath = mirror.mirrorpath.string
+            data = ElementTree.fromstring(page)
+            for mirror in data.findall('Mirror'):
+                type_mask = int(mirror.find("typemask").text)
+                mirrorpath = mirror.find("mirrorpath").text
                 for t in [(1, 'xml'), (2, 'banner'), (4, 'zip')]:
                     if type_mask & t[0]:
                         _mirrors.setdefault(t[1], set()).add(mirrorpath)
@@ -82,23 +93,28 @@ def get_mirror(type='xml'):
 class TVDBContainer(object):
     """Base class for TVDb objects"""
 
-    def __init__(self, init_bss=None):
-        if init_bss:
-            self.update_from_bss(init_bss)
+    def __init__(self, init_xml=None):
+        if init_xml is not None:
+            self.update_from_xml(init_xml)
 
-    def update_from_bss(self, update_bss):
+    def update_from_xml(self, update_xml):
         """Populates any simple (string or number) attributes from a dict"""
-        for col in self.__table__.columns:
-            tag = update_bss.find(col.name)
-            if tag and tag.string:
-                if isinstance(col.type, Integer):
-                    value = int(tag.string)
-                elif isinstance(col.type, Float):
-                    value = float(tag.string)
-                else:
-                    # BeautifulSoup used to take care of the html entities... but seems to have stopped.
-                    value = decode_html(tag.string)
-                setattr(self, col.name, value)
+        for node in update_xml:
+            if not node.text or not node.tag:
+                continue
+
+            # Have to iterate to get around the inability to do a case-insensitive find
+            for col in self.__table__.columns:
+                if node.tag.lower() == col.name.lower():
+                    if isinstance(col.type, Integer):
+                        value = int(node.text)
+                    elif isinstance(col.type, Float):
+                        value = float(node.text)
+                    else:
+                        # Make sure we always have unicode strings
+                        value = node.text.decode('utf-8') if isinstance(node.text, str) else node.text
+                        value = decode_html(value)
+                    setattr(self, col.name, value)
         self.expired = False
 
 
@@ -118,6 +134,7 @@ class TVDBSeries(TVDBContainer, Base):
     airs_dayofweek = Column(Unicode)
     contentrating = Column(Unicode)
     network = Column(Unicode)
+    overview = Column(Unicode)
     imdb_id = Column(String)
     zap2it_id = Column(String)
     banner = Column(String)
@@ -128,20 +145,21 @@ class TVDBSeries(TVDBContainer, Base):
     genre = pipe_list_synonym('_genre')
     _firstaired = Column('firstaired', DateTime)
     firstaired = text_date_synonym('_firstaired')
+    _actors = Column('actors', Unicode)
+    actors = pipe_list_synonym('_actors')
 
     episodes = relation('TVDBEpisode', backref='series', cascade='all, delete, delete-orphan')
 
-    def update(self):
-        if not self.id:
-            raise LookupError('Cannot update a series without a tvdb id.')
-        url = get_mirror() + api_key + '/series/%s/%s.xml' % (self.id, language)
+    def update(self, tvdb_id=None):
+        tvdb_id = tvdb_id or self.id
+        url = get_mirror() + api_key + '/series/%s/%s.xml' % (tvdb_id, language)
         try:
             data = requests.get(url).content
         except RequestException as e:
             raise LookupError('Request failed %s' % url)
-        result = BeautifulStoneSoup(data, convertEntities=BeautifulStoneSoup.HTML_ENTITIES).find('series')
-        if result:
-            self.update_from_bss(result)
+        result = ElementTree.fromstring(data).find('Series')
+        if result is not None:
+            self.update_from_xml(result)
         else:
             raise LookupError('Could not retrieve information from thetvdb')
 
@@ -167,9 +185,8 @@ class TVDBSeries(TVDBContainer, Base):
         self.poster_file = filename
         # If we are detached from a session, update the db
         if not Session.object_session(self):
-            session = Session()
-            session.query(TVDBSeries).filter(TVDBSeries.id == self.id).update(values={'poster_file': filename})
-            session.close()
+            with Session() as session:
+                session.query(TVDBSeries).filter(TVDBSeries.id == self.id).update(values={'poster_file': filename})
         return filename
 
     def __repr__(self):
@@ -208,9 +225,9 @@ class TVDBEpisode(TVDBContainer, Base):
             data = requests.get(url).content
         except RequestException as e:
             raise LookupError('Request failed %s' % url)
-        result = BeautifulStoneSoup(data, convertEntities=BeautifulStoneSoup.HTML_ENTITIES).find('episode')
-        if result:
-            self.update_from_bss(result)
+        result = ElementTree.fromstring(data).find('Episode')
+        if result is not None:
+            self.update_from_xml(result)
         else:
             raise LookupError('Could not retrieve information from thetvdb')
 
@@ -235,19 +252,28 @@ def find_series_id(name):
     try:
         page = requests.get(url).content
     except RequestException as e:
-        raise LookupError("Unable to get search results for %s: %s" % (name, e))
-    xmldata = BeautifulStoneSoup(page, convertEntities=BeautifulStoneSoup.HTML_ENTITIES).data
-    if not xmldata:
+        raise LookupError('Unable to get search results for %s: %s' % (name, e))
+    try:
+        xmldata = ElementTree.fromstring(page)
+    except ParseError as e:
+        log.error('error parsing tvdb result for %s: %s' % (name, e))
+        return
+    if xmldata is None:
         log.error("Didn't get a return from tvdb on the series search for %s" % name)
         return
     # See if there is an exact match
     # TODO: Check if there are multiple exact matches
-    firstmatch = xmldata.find('series')
-    if firstmatch and firstmatch.seriesname.string.lower() == name.lower():
-        return int(firstmatch.seriesid.string)
+    firstmatch = xmldata.find('Series')
+    if firstmatch is not None and firstmatch.find("SeriesName").text.lower() == name.lower():
+        return int(firstmatch.find("seriesid").text)
     # If there is no exact match, sort by airing date and pick the latest
     # TODO: Is there a better way to do this? Maybe weight name similarity and air date
-    series_list = [(s.firstaired.string, s.seriesid.string) for s in xmldata.findAll('series', recursive=False) if s.firstaired]
+    series_list = []
+    for s in xmldata.findall('Series'):
+        fa = s.find("FirstAired")
+        if fa is not None and fa.text:
+            series_list.append((fa.text, s.find("seriesid").text))
+
     if series_list:
         series_list.sort(key=lambda s: s[0], reverse=True)
         return int(series_list[0][1])
@@ -255,9 +281,24 @@ def find_series_id(name):
         raise LookupError('No results for `%s`' % name)
 
 
-@with_session
+@with_session(expire_on_commit=False)
 def lookup_series(name=None, tvdb_id=None, only_cached=False, session=None):
-    if not name and not tvdb_id:
+    """
+    Look up information on a series. Will be returned from cache if available, and looked up online and cached if not.
+
+    Either `name` or `tvdb_id` parameter are needed to specify the series.
+    :param unicode name: Name of series.
+    :param int tvdb_id: TVDb ID of series.
+    :param bool only_cached: If True, will not cause an online lookup. LookupError will be raised if not available
+        in the cache.
+    :param session: An sqlalchemy session to be used to lookup and store to cache. Commit(s) may occur when passing in
+        a session. If one is not supplied it will be created.
+
+    :return: Instance of :class:`TVDBSeries` populated with series information. If session was not supplied, this will
+        be a detached from the database, so relationships cannot be loaded.
+    :raises: :class:`LookupError` if series cannot be looked up.
+    """
+    if not (name or tvdb_id):
         raise LookupError('No criteria specified for tvdb lookup')
 
     log.debug('Looking up tvdb information for %r' % {'name': name, 'tvdb_id': tvdb_id})
@@ -280,12 +321,12 @@ def lookup_series(name=None, tvdb_id=None, only_cached=False, session=None):
         # Series found in cache, update if cache has expired.
         if not only_cached:
             mark_expired(session=session)
-        if series.expired and not only_cached:
+        if not only_cached and series.expired:
             log.verbose('Data for %s has expired, refreshing from tvdb' % series.seriesname)
             try:
                 series.update()
             except LookupError as e:
-                log.warning('Error while updating from tvdb (%s), using cached data.' % e.message)
+                log.warning('Error while updating from tvdb (%s), using cached data.' % e.args[0])
         else:
             log.debug('Series %s information restored from cache.' % id_str())
     else:
@@ -295,8 +336,7 @@ def lookup_series(name=None, tvdb_id=None, only_cached=False, session=None):
         log.debug('Series %s not found in cache, looking up from tvdb.' % id_str())
         if tvdb_id:
             series = TVDBSeries()
-            series.id = tvdb_id
-            series.update()
+            series.update(tvdb_id)
             if series.seriesname:
                 session.add(series)
         elif name:
@@ -305,8 +345,7 @@ def lookup_series(name=None, tvdb_id=None, only_cached=False, session=None):
                 series = session.query(TVDBSeries).filter(TVDBSeries.id == tvdb_id).first()
                 if not series:
                     series = TVDBSeries()
-                    series.id = tvdb_id
-                    series.update()
+                    series.update(tvdb_id)
                     session.add(series)
                 if name.lower() != series.seriesname.lower():
                     session.add(TVDBSearchResult(search=name, series=series))
@@ -315,44 +354,64 @@ def lookup_series(name=None, tvdb_id=None, only_cached=False, session=None):
         raise LookupError('No results found from tvdb for %s' % id_str())
     if not series.seriesname:
         raise LookupError('Tvdb result for series does not have a title.')
-    series.episodes
+    session.commit()
     return series
 
 
-@with_session
+@with_session(expire_on_commit=False)
 def lookup_episode(name=None, seasonnum=None, episodenum=None, absolutenum=None, airdate=None,
                    tvdb_id=None, only_cached=False, session=None):
+    """
+    Look up information on an episode. Will be returned from cache if available, and looked up online and cached if not.
+
+    Either `name` or `tvdb_id` parameter are needed to specify the series.
+    Either `seasonnum` and `episodedum`, `absolutenum`, or `airdate` are required to specify episode number.
+    :param unicode name: Name of series episode belongs to.
+    :param int tvdb_id: TVDb ID of series episode belongs to.
+    :param int seasonnum: Season number of episode.
+    :param int episodenum: Episode number of episode.
+    :param int absolutenum: Absolute number of episode.
+    :param int airdate: Air date of episode.
+    :param bool only_cached: If True, will not cause an online lookup. LookupError will be raised if not available
+        in the cache.
+    :param session: An sqlalchemy session to be used to lookup and store to cache. Commit(s) may occur when passing in
+        a session. If one is not supplied it will be created, however if you need to access relationships you should
+        pass one in.
+
+    :return: Instance of :class:`TVDBEpisode` populated with series information.
+    :raises: :class:`LookupError` if episode cannot be looked up.
+    """
     # First make sure we have the series data
     series = lookup_series(name=name, tvdb_id=tvdb_id, only_cached=only_cached, session=session)
-    if not series:
-        raise LookupError('Could not identify series')
     # Set variables depending on what type of identifier we are looking up
-    if airdate:
+    if airdate is not None:
         airdatestring = airdate.strftime('%Y-%m-%d')
         ep_description = '%s.%s' % (series.seriesname, airdatestring)
         episode = session.query(TVDBEpisode).filter(TVDBEpisode.series_id == series.id).\
             filter(TVDBEpisode.firstaired == airdate).first()
         url = get_mirror() + ('GetEpisodeByAirDate.php?apikey=%s&seriesid=%d&airdate=%s&language=%s' %
                              (api_key, series.id, airdatestring, language))
-    elif absolutenum:
+    elif absolutenum is not None:
         ep_description = '%s.%d' % (series.seriesname, absolutenum)
         episode = session.query(TVDBEpisode).filter(TVDBEpisode.series_id == series.id).\
             filter(TVDBEpisode.absolute_number == absolutenum).first()
         url = get_mirror() + api_key + '/series/%d/absolute/%s/%s.xml' % (series.id, absolutenum, language)
-    else:
+    elif seasonnum is not None and episodenum is not None:
         ep_description = '%s.S%sE%s' % (series.seriesname, seasonnum, episodenum)
         # See if we have this episode cached
         episode = session.query(TVDBEpisode).filter(TVDBEpisode.series_id == series.id).\
             filter(TVDBEpisode.seasonnumber == seasonnum).\
             filter(TVDBEpisode.episodenumber == episodenum).first()
         url = get_mirror() + api_key + '/series/%d/default/%d/%d/%s.xml' % (series.id, seasonnum, episodenum, language)
+    else:
+        raise LookupError('No episode identifier specified.')
     if episode:
         if episode.expired and not only_cached:
             log.info('Data for %r has expired, refreshing from tvdb' % episode)
             try:
                 episode.update()
             except LookupError as e:
-                log.warning('Error while updating from tvdb (%s), using cached data.' % e.message)
+                log.warning('Error while updating from tvdb (%s), using cached data.' % e.args[0])
         else:
             log.debug('Using episode info for %s from cache.' % ep_description)
     else:
@@ -362,17 +421,17 @@ def lookup_episode(name=None, seasonnum=None, episodenum=None, absolutenum=None,
         log.debug('Episode %s not found in cache, looking up from tvdb.' % ep_description)
         try:
             raw_data = requests.get(url).content
-            data = BeautifulStoneSoup(raw_data, convertEntities=BeautifulStoneSoup.HTML_ENTITIES).data
-            if data:
-                error = data.find('error')
-                if error:
-                    raise LookupError('Error lookuing up episode from TVDb (%s)' % error.string)
-                ep_data = data.find('episode')
-                if ep_data:
+            data = ElementTree.fromstring(raw_data)
+            if data is not None:
+                error = data.find('Error') # TODO: lowercase????
+                if error is not None:
+                    raise LookupError('Error looking up episode from TVDb (%s)' % error.text)
+                ep_data = data.find('Episode')
+                if ep_data is not None:
                     # Check if this episode id is already in our db
-                    episode = session.query(TVDBEpisode).filter(TVDBEpisode.id == ep_data.id.string).first()
-                    if episode:
-                        episode.update_from_bss(ep_data)
+                    episode = session.query(TVDBEpisode).filter(TVDBEpisode.id == ep_data.find("id").text).first()
+                    if episode is not None:
+                        episode.update_from_xml(ep_data)
                     else:
                         episode = TVDBEpisode(ep_data)
                     series.episodes.append(episode)
@@ -380,8 +439,7 @@ def lookup_episode(name=None, seasonnum=None, episodenum=None, absolutenum=None,
         except RequestException as e:
             raise LookupError('Error looking up episode from TVDb (%s)' % e)
     if episode:
-        # Access the series attribute to force it to load before returning
-        episode.series
+        session.commit()
         return episode
     else:
         raise LookupError('No results found for ')
@@ -397,7 +455,7 @@ def mark_expired(session=None):
     if not last_local:
         # Never run before? Lets reset ALL series
         log.info('Setting all series to expire')
-        session.query(TVDBSeries).update({'expired': True}, 'fetch')
+        session.query(TVDBSeries).update({'expired': True}, synchronize_session='fetch')
         persist['last_local'] = datetime.now()
         return
     elif last_local + timedelta(hours=6) > datetime.now():
@@ -423,15 +481,15 @@ def mark_expired(session=None):
         content = requests.get(server + api_key + '/updates/updates_%s.xml' % get_update).content
         if not isinstance(content, basestring):
             raise Exception('expected string, got %s' % type(content))
-        updates = BeautifulStoneSoup(content, convertEntities=BeautifulStoneSoup.HTML_ENTITIES).data
+        updates = ElementTree.fromstring(content)
     except RequestException as e:
         log.error('Could not get update information from tvdb: %s' % e)
         return
 
-    if updates:
-        new_server = int(updates['time'])
+    if updates is not None:
+        new_server = int(updates.attrib['time'])
 
-        if new_server < last_server:
+        if new_server <= last_server:
             #nothing changed on the server, ignoring
             log.debug("Not checking for expired as nothing has changed on server")
             return
@@ -440,11 +498,11 @@ def mark_expired(session=None):
         expired_series = []
         expired_episodes = []
 
-        for series in updates.findAll('series', recursive=False):
-            expired_series.append(int(series.id.string))
+        for series in updates.findall('Series'):
+            expired_series.append(int(series.find("id").text))
 
-        for episode in updates.findAll('episode', recursive=False):
-            expired_series.append(int(episode.id.string))
+        for episode in updates.findall('Episode'):
+            expired_series.append(int(episode.find("id").text))
 
         def chunked(seq):
             """Helper to divide our expired lists into sizes sqlite can handle in a query. (<1000)"""
@@ -460,5 +518,6 @@ def mark_expired(session=None):
             log.debug('%s episodes marked as expired' % num)
 
         # Save the time of this update
+        session.commit()
         persist['last_local'] = datetime.now()
         persist['last_server'] = new_server

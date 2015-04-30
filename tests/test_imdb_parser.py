@@ -1,12 +1,12 @@
 from __future__ import unicode_literals, division, absolute_import
 
-from nose.plugins.attrib import attr
 
 from flexget.utils.imdb import ImdbParser
+from tests import use_vcr
 
 
 class TestImdbParser(object):
-    @attr(online=True)
+    @use_vcr
     def test_parsed_data(self):
         parser = ImdbParser()
         parser.parse('tt0114814')
@@ -28,13 +28,13 @@ class TestImdbParser(object):
             'nm0000860': 'Paul Bartel'
         }, 'Actors not parsed correctly'
         assert parser.directors == {'nm0001741': 'Bryan Singer'}, 'Directors not parsed correctly'
-        assert parser.genres == [u'crime', u'mystery', u'thriller'], 'Genres not parsed correctly'
+        assert parser.genres == [u'crime', u'drama', u'thriller'], 'Genres not parsed correctly'
         assert parser.imdb_id == 'tt0114814', 'ID not parsed correctly'
         assert parser.languages == ['english', 'hungarian', 'spanish', 'french'], 'Languages not parsed correctly'
         assert parser.mpaa_rating == 'R', 'Rating not parsed correctly'
         assert parser.name == 'The Usual Suspects', 'Name not parsed correctly'
         assert (parser.photo ==
-                'http://ia.media-imdb.com/images/M/MV5BMzI1MjI5MDQyOV5BMl5BanBnXkFtZTcwNzE4Mjg3NA@@._V1_SX214_.jpg'
+                'http://ia.media-imdb.com/images/M/MV5BMzI1MjI5MDQyOV5BMl5BanBnXkFtZTcwNzE4Mjg3NA@@._V1_SX214_AL_.jpg'
         ), 'Photo not parsed correctly'
         assert parser.plot_outline == (
             'Following a truck hijack in New York, five conmen are arrested and brought together for questioning. '
@@ -45,10 +45,10 @@ class TestImdbParser(object):
         ), 'Plot outline not parsed correctly'
         assert 8.0 < parser.score < 9.0, 'Score not parsed correctly'
         assert parser.url == 'http://www.imdb.com/title/tt0114814/', 'URL not parsed correctly'
-        assert 400000 < parser.votes < 500000, 'Votes not parsed correctly'
+        assert 400000 < parser.votes < 1000000, 'Votes not parsed correctly'
         assert parser.year == 1995, 'Year not parsed correctly'
 
-    @attr(online=True)
+    @use_vcr
     def test_no_plot(self):
         # Make sure parser doesn't crash for movies with no plot
         parser = ImdbParser()

@@ -6,7 +6,14 @@ python:
 install:
   - pip install paver
   - pip install .
+  - pip install -r jenkins-requirements.txt
 # command to run tests, e.g. python setup.py test
-script: nosetests --attr !online
+script: nosetests -q --attr !online
+env: VCR_RECORD_MODE=none
 notifications:
   email: false
+  webhooks:
+    urls:
+    - http://n.tkte.ch/h/343/-Sl5O1RgMVaGmIAJDbblXVIc
+    on_success: change
+    on_failure: always

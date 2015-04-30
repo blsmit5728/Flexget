@@ -1,19 +1,11 @@
 from __future__ import unicode_literals, division, absolute_import
 import re
 
-
-class ParseWarning(Warning):
-
-    def __init__(self, value, **kwargs):
-        self.value = value
-        self.kwargs = kwargs
-
-
 class TitleParser(object):
 
     propers = ['proper', 'repack', 'rerip', 'real', 'final']
 
-    specials = ['special']
+    specials = ['special', 'bonus', 'extra', 'omake', 'ova']
 
     editions = ['dc', 'extended', 'uncut', 'remastered', 'unrated', 'theatrical', 'chrono', 'se']
 

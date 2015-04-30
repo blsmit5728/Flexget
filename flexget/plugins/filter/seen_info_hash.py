@@ -1,21 +1,25 @@
 from __future__ import unicode_literals, division, absolute_import
-from flexget.plugin import register_plugin, priority
+
+from flexget import plugin
+from flexget.event import event
 from flexget.plugins.filter.seen import FilterSeen
 
 
 class FilterSeenInfoHash(FilterSeen):
     """Prevents the same torrent from being downloaded twice by remembering the infohash of all downloaded torrents."""
+    schema = {
+        'oneOf': [
+            {'type': 'boolean'},
+            {'type': 'string', 'enum': ['global', 'local']}
+        ]
+    }
 
     def __init__(self):
         # remember and filter by these fields
         self.fields = ['torrent_info_hash']
         self.keyword = 'seen_info_hash'
 
-    def validator(self):
-        from flexget import validator
-        return validator.factory('boolean')
-
-    @priority(180)
+    @plugin.priority(180)
     def on_task_filter(self, task, config):
         # Return if we are disabled.
         if config is False:
@@ -42,4 +46,7 @@ class FilterSeenInfoHash(FilterSeen):
                 else:
                     accepted_infohashes.add(infohash)
 
-register_plugin(FilterSeenInfoHash, 'seen_info_hash', builtin=True, api_ver=2)
+
+@event('plugin.register')
+def register_plugin():
+    plugin.register(FilterSeenInfoHash, 'seen_info_hash', builtin=True, api_ver=2)

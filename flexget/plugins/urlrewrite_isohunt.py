@@ -5,9 +5,10 @@ import urllib
 
 import feedparser
 
+from flexget import plugin
 from flexget.entry import Entry
+from flexget.event import event
 from flexget.utils.search import torrent_availability, normalize_unicode
-from flexget.plugin import PluginWarning, register_plugin
 
 log = logging.getLogger('isohunt')
 
@@ -35,13 +36,11 @@ class UrlRewriteIsoHunt(object):
       12: ALL
     """
 
-    def validator(self):
-        from flexget import validator
-
-        root = validator.factory('choice')
-        root.accept_choices(['misc', 'movies', 'audio', 'tv', 'games', 'apps', 'pics', 'anime', 'comics',
-                             'books', 'music video', 'unclassified', 'all'])
-        return root
+    schema = {
+        'type': 'string',
+        'enum': ['misc', 'movies', 'audio', 'tv', 'games', 'apps', 'pics', 'anime', 'comics', 'books', 'music video',
+                 'unclassified', 'all']
+    }
 
     def url_rewritable(self, task, entry):
         url = entry['url']
@@ -56,7 +55,7 @@ class UrlRewriteIsoHunt(object):
     def url_rewrite(self, task, entry):
         entry['url'] = entry['url'].replace('torrent_details', 'download')
 
-    def search(self, entry, config):
+    def search(self, task, entry, config):
         # urllib.quote will crash if the unicode string has non ascii characters, so encode in utf-8 beforehand
         optionlist = ['misc', 'movies', 'audio', 'tv', 'games', 'apps', 'pics', 'anime', 'comics', 'books',
                       'music video', 'unclassified', 'all']
@@ -71,11 +70,11 @@ class UrlRewriteIsoHunt(object):
 
             status = rss.get('status', False)
             if status != 200:
-                raise PluginWarning('Search result not 200 (OK), received %s' % status)
+                raise plugin.PluginWarning('Search result not 200 (OK), received %s' % status)
 
             ex = rss.get('bozo_exception', False)
             if ex:
-                raise PluginWarning('Got bozo_exception (bad feed)')
+                raise plugin.PluginWarning('Got bozo_exception (bad feed)')
 
             for item in rss.entries:
                 entry = Entry()
@@ -98,4 +97,7 @@ class UrlRewriteIsoHunt(object):
 
         return entries
 
-register_plugin(UrlRewriteIsoHunt, 'isohunt', groups=['urlrewriter', 'search'])
+
+@event('plugin.register')
+def register_plugin():
+    plugin.register(UrlRewriteIsoHunt, 'isohunt', groups=['urlrewriter', 'search'], api_ver=2)

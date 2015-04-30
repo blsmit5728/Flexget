@@ -1,8 +1,11 @@
 from __future__ import unicode_literals, division, absolute_import
 import logging
 import os
+import socket
 import urllib2
-from flexget.plugin import PluginError, register_plugin
+
+from flexget import plugin
+from flexget.event import event
 
 log = logging.getLogger('formlogin')
 
@@ -12,21 +15,24 @@ class FormLogin(object):
     Login on form
     """
 
-    def validator(self):
-        from flexget import validator
-        root = validator.factory('dict')
-        root.accept('url', key='url', required=True)
-        root.accept('text', key='username', required=True)
-        root.accept('text', key='password', required=True)
-        root.accept('text', key='userfield')
-        root.accept('text', key='passfield')
-        return root
+    schema = {
+        'type': 'object',
+        'properties': {
+            'url': {'type': 'string', 'format': 'url'},
+            'username': {'type': 'string'},
+            'password': {'type': 'string'},
+            'userfield': {'type': 'string'},
+            'passfield': {'type': 'string'}
+        },
+        'required': ['url', 'username', 'password'],
+        'additionalProperties': False
+    }
 
     def on_task_start(self, task, config):
         try:
             from mechanize import Browser
         except ImportError:
-            raise PluginError('mechanize required (python module), please install it.', log)
+            raise plugin.PluginError('mechanize required (python module), please install it.', log)
 
         userfield = config.get('userfield', 'username')
         passfield = config.get('passfield', 'password')
@@ -41,30 +47,33 @@ class FormLogin(object):
             br.open(url)
         except Exception as e:
             # TODO: improve error handling
-            raise PluginError('Unable to post login form', log)
+            raise plugin.PluginError('Unable to post login form', log)
 
         #br.set_debug_redirects(True)
         #br.set_debug_responses(True)
         #br.set_debug_http(True)
 
-        for form in br.forms():
-            loginform = form
+        try:
+            for form in br.forms():
+                loginform = form
 
-            try:
-                loginform[userfield] = username
-                loginform[passfield] = password
-                break
-            except Exception as e:
-                pass
-        else:
-            received = os.path.join(task.manager.config_base, 'received')
-            if not os.path.isdir(received):
-                os.mkdir(received)
-            filename = os.path.join(received, '%s.formlogin.html' % task.name)
-            with open(filename, 'w') as f:
-                f.write(br.response().get_data())
-            log.critical('I have saved the login page content to %s for you to view' % filename)
-            raise PluginError('Unable to find login fields', log)
+                try:
+                    loginform[userfield] = username
+                    loginform[passfield] = password
+                    break
+                except Exception as e:
+                    pass
+            else:
+                received = os.path.join(task.manager.config_base, 'received')
+                if not os.path.isdir(received):
+                    os.mkdir(received)
+                filename = os.path.join(received, '%s.formlogin.html' % task.name)
+                with open(filename, 'w') as f:
+                    f.write(br.response().get_data())
+                log.critical('I have saved the login page content to %s for you to view' % filename)
+                raise plugin.PluginError('Unable to find login fields', log)
+        except socket.timeout:
+            raise plugin.PluginError('Timed out on url %s' % url)
 
         br.form = loginform
 
@@ -91,4 +100,6 @@ class FormLogin(object):
     # Task aborted, unhook the cookiejar
     on_task_abort = on_task_exit
 
-register_plugin(FormLogin, 'form', api_ver=2)
+@event('plugin.register')
+def register_plugin():
+    plugin.register(FormLogin, 'form', api_ver=2)

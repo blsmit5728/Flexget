@@ -1,22 +1,30 @@
 from __future__ import unicode_literals, division, absolute_import
 from datetime import datetime, timedelta
 import logging
-from urllib2 import URLError, quote
 import os
 import posixpath
+import socket
+import sys
+from urllib2 import URLError
 
 from sqlalchemy import Table, Column, Integer, Float, String, Unicode, Boolean, DateTime, func
 from sqlalchemy.schema import ForeignKey
 from sqlalchemy.orm import relation
 
-from flexget import db_schema
-from flexget.utils.sqlalchemy_utils import table_add_column, table_schema
-from flexget.utils.titles import MovieParser
+from flexget import db_schema, plugin
+from flexget.event import event
+from flexget.manager import Session
+from flexget.plugin import get_plugin_by_name
 from flexget.utils import requests
 from flexget.utils import json
 from flexget.utils.database import text_date_synonym, year_property, with_session
-from flexget.manager import Session
-from flexget.plugin import register_plugin
+from flexget.utils.sqlalchemy_utils import table_add_column, table_schema
+
+try:
+    import tmdb3
+except ImportError:
+    raise plugin.DependencyError(issued_by='api_tmdb', missing='tmdb3',
+                                 message='TMDB requires https://github.com/wagnerrp/pytmdb3')
 
 try:
     import simplejson as myjson
@@ -27,10 +35,18 @@ log = logging.getLogger('api_tmdb')
 Base = db_schema.versioned_base('api_tmdb', 0)
 
 # This is a FlexGet API key
+<<<<<<< HEAD
 #api_key = 'bdfc018dbdb7c243dc7cb1454ff74b95'
 api_key = 'f364752b279d93d918ea567896cb1485'
 lang = 'en'
 server = 'https://api.themoviedb.org'
+=======
+tmdb3.tmdb_api.set_key('bdfc018dbdb7c243dc7cb1454ff74b95')
+tmdb3.locales.set_locale("en", "us", True)
+# There is a bug in tmdb3 library, where it uses the system encoding for query parameters, tmdb expects utf-8 #2392
+tmdb3.locales.syslocale.encoding = 'utf-8'
+tmdb3.set_cache('null')
+>>>>>>> upstream/master
 
 
 @db_schema.upgrade('api_tmdb')
@@ -59,9 +75,11 @@ genres_table = Table('tmdb_movie_genres', Base.metadata,
 class TMDBContainer(object):
     """Base class for TMDb objects"""
 
-    def __init__(self, init_dict=None):
-        if isinstance(init_dict, dict):
-            self.update_from_dict(init_dict)
+    def __init__(self, init_object=None):
+        if isinstance(init_object, dict):
+            self.update_from_dict(init_object)
+        elif init_object:
+            self.update_from_object(init_object)
 
     def update_from_dict(self, update_dict):
         """Populates any simple (string or number) attributes from a dict"""
@@ -69,9 +87,14 @@ class TMDBContainer(object):
             if isinstance(update_dict.get(col.name), (basestring, int, float)):
                 setattr(self, col.name, update_dict[col.name])
 
+    def update_from_object(self, update_object):
+        """Populates any simple (string or number) attributes from object attributes"""
+        for col in self.__table__.columns:
+            if hasattr(update_object, col.name) and isinstance(getattr(update_object, col.name), (basestring, int, float)):
+                setattr(self, col.name, getattr(update_object, col.name))
+
 
 class TMDBMovie(TMDBContainer, Base):
-
     __tablename__ = 'tmdb_movies'
 
     id = Column(Integer, primary_key=True, autoincrement=False, nullable=False)
@@ -102,6 +125,32 @@ class TMDBMovie(TMDBContainer, Base):
     posters = relation('TMDBPoster', backref='movie', cascade='all, delete, delete-orphan')
     genres = relation('TMDBGenre', secondary=genres_table, backref='movies')
 
+    def update_from_object(self, update_object):
+        try:
+            TMDBContainer.update_from_object(self, update_object)
+            self.translated = len(update_object.translations) > 0
+            if len(update_object.languages) > 0:
+                self.language = update_object.languages[0].code #.code or .name ?
+            self.original_name = update_object.originaltitle
+            self.name = update_object.title
+            try:
+                if len(update_object.alternate_titles) > 0:
+                    # maybe we could choose alternate title from movie country only
+                    self.alternative_name = update_object.alternate_titles[0].title
+            except UnicodeEncodeError:
+                # Bug in tmdb3 library, see #2437. Just don't set alternate_name when it fails
+                pass
+            self.imdb_id = update_object.imdb
+            self.url = update_object.homepage
+            self.rating = update_object.userrating
+            if len(update_object.youtube_trailers) > 0:
+                self.trailer = update_object.youtube_trailers[0].source # unicode: ooNSm6Uug3g
+            elif len(update_object.apple_trailers) > 0:
+                self.trailer = update_object.apple_trailers[0].source
+            self.released = update_object.releasedate
+        except tmdb3.TMDBError as e:
+            raise LookupError('Error updating data from tmdb: %s' % e)
+
 
 class TMDBGenre(TMDBContainer, Base):
 
@@ -119,8 +168,6 @@ class TMDBPoster(TMDBContainer, Base):
     movie_id = Column(Integer, ForeignKey('tmdb_movies.id'))
     size = Column(String)
     url = Column(String)
-    id = Column(String)
-    type = Column(String)
     file = Column(Unicode)
 
     def get_file(self, only_cached=False):
@@ -146,11 +193,12 @@ class TMDBPoster(TMDBContainer, Base):
         # If we are detached from a session, update the db
         if not Session.object_session(self):
             session = Session()
-            poster = session.query(TMDBPoster).filter(TMDBPoster.db_id == self.db_id).first()
-            if poster:
-                poster.file = filename
-                session.commit()
-            session.close()
+            try:
+                poster = session.query(TMDBPoster).filter(TMDBPoster.db_id == self.db_id).first()
+                if poster:
+                    poster.file = filename
+            finally:
+                session.close()
         return filename.split(os.sep)
 
 
@@ -168,42 +216,41 @@ class ApiTmdb(object):
     """Does lookups to TMDb and provides movie information. Caches lookups."""
 
     @staticmethod
-    @with_session
+    @with_session(expire_on_commit=False)
     def lookup(title=None, year=None, tmdb_id=None, imdb_id=None, smart_match=None, only_cached=False, session=None):
-        """Do a lookup from tmdb for the movie matching the passed arguments.
+        """
+        Do a lookup from TMDb for the movie matching the passed arguments.
 
         Any combination of criteria can be passed, the most specific criteria specified will be used.
 
-        Returns:
-            The Movie object populated with data from tmdb
+        :param int tmdb_id: tmdb_id of desired movie
+        :param unicode imdb_id: imdb_id of desired movie
+        :param unicode title: title of desired movie
+        :param int year: release year of desired movie
+        :param unicode smart_match: attempt to clean and parse title and year from a string
+        :param bool only_cached: if this is specified, an online lookup will not occur if the movie is not in the cache
+        session: optionally specify a session to use, if specified, returned Movie will be live in that session
+        :param session: sqlalchemy Session in which to do cache lookups/storage. commit may be called on a passed in
+            session. If not supplied, a session will be created automatically.
 
-        Raises:
-            LookupError if a match cannot be found or there are other problems with the lookup
+        :return: The :class:`TMDBMovie` object populated with data from tmdb
 
-        Args:
-            tmdb_id: tmdb_id of desired movie
-            imdb_id: imdb_id of desired movie
-            title: title of desired movie
-            year: release year of desired movie
-            smart_match: attempt to clean and parse title and year from a string
-            only_cached: if this is specified, an online lookup will not occur if the movie is not in the cache
-            session: optionally specify a session to use, if specified, returned Movie will be live in that session
+        :raises: :class:`LookupError` if a match cannot be found or there are other problems with the lookup
         """
 
         if not (tmdb_id or imdb_id or title) and smart_match:
             # If smart_match was specified, and we don't have more specific criteria, parse it into a title and year
-            title_parser = MovieParser()
-            title_parser.parse(smart_match)
+            title_parser = get_plugin_by_name('parsing').instance.parse_movie(smart_match)
             title = title_parser.name
             year = title_parser.year
 
         if title:
             search_string = title.lower()
             if year:
-                search_string = '%s %s' % (search_string, year)
+                search_string = '%s (%s)' % (search_string, year)
         elif not (tmdb_id or imdb_id):
-            raise LookupError('No criteria specified for tmdb lookup')
-        log.debug('Looking up tmdb information for %r' % {'title': title, 'tmdb_id': tmdb_id, 'imdb_id': imdb_id})
+            raise LookupError('No criteria specified for TMDb lookup')
+        log.debug('Looking up TMDb information for %r' % {'title': title, 'tmdb_id': tmdb_id, 'imdb_id': imdb_id})
 
         movie = None
 
@@ -245,18 +292,22 @@ class ApiTmdb(object):
             if only_cached:
                 raise LookupError('Movie %s not found from cache' % id_str())
             # There was no movie found in the cache, do a lookup from tmdb
-            log.debug('Movie %s not found in cache, looking up from tmdb.' % id_str())
+            log.verbose('Searching from TMDb %s' % id_str())
             try:
                 if imdb_id and not tmdb_id:
+<<<<<<< HEAD
                     result = get_first_result('imdbLookup', imdb_id)
                     print "From get: " % result
+=======
+                    result = tmdb3.Movie.fromIMDB(imdb_id)
+>>>>>>> upstream/master
                     if result:
-                        movie = session.query(TMDBMovie).filter(TMDBMovie.id == result['id']).first()
+                        movie = session.query(TMDBMovie).filter(TMDBMovie.id == result.id).first()
                         if movie:
                             # Movie was in database, but did not have the imdb_id stored, force an update
-                            ApiTmdb.get_movie_details(movie, session)
+                            ApiTmdb.get_movie_details(movie, session, result)
                         else:
-                            tmdb_id = result['id']
+                            tmdb_id = result.id
                 if tmdb_id:
                     movie = TMDBMovie()
                     movie.id = tmdb_id
@@ -266,32 +317,38 @@ class ApiTmdb(object):
                     else:
                         movie = None
                 elif title:
-                    result = get_first_result('search', search_string)
+                    try:
+                        result = _first_result(tmdb3.tmdb_api.searchMovie(title.lower(), adult=True, year=year))
+                    except socket.timeout:
+                        raise LookupError('Timeout contacting TMDb')
+                    if not result and year:
+                        result = _first_result(tmdb3.tmdb_api.searchMovie(title.lower(), adult=True))
                     if result:
-                        movie = session.query(TMDBMovie).filter(TMDBMovie.id == result['id']).first()
+                        movie = session.query(TMDBMovie).filter(TMDBMovie.id == result.id).first()
                         if not movie:
                             movie = TMDBMovie(result)
-                            ApiTmdb.get_movie_details(movie, session)
+                            ApiTmdb.get_movie_details(movie, session, result)
                             session.merge(movie)
                         if title.lower() != movie.name.lower():
                             session.merge(TMDBSearchResult(search=search_string, movie=movie))
-            except URLError:
-                raise LookupError('Error looking up movie from TMDb')
+            except tmdb3.TMDBError as e:
+                raise LookupError('Error looking up movie from TMDb (%s)' % e)
+            if movie:
+                log.verbose("Movie found from TMDb: %s (%s)" % (movie.name, movie.year))
 
         if not movie:
             raise LookupError('No results found from tmdb for %s' % id_str())
         else:
-            # Access attributes to force the relationships to eager load before we detach from session
-            movie.genres
-            movie.posters
+            session.commit()
             return movie
 
     @staticmethod
-    def get_movie_details(movie, session):
+    def get_movie_details(movie, session, result=None):
         """Populate details for this :movie: from TMDb"""
 
-        if not movie.id:
+        if not result and not movie.id:
             raise LookupError('Cannot get tmdb details without tmdb id')
+<<<<<<< HEAD
         result = get_first_result('getInfo', movie.id)
         #print "Result from getInfo= " + result.get('posters')
         if result:
@@ -352,3 +409,47 @@ def get_first_result(tmdb_function, value):
             return result
 
 register_plugin(ApiTmdb, 'api_tmdb')
+=======
+        if not result:
+            try:
+                result = tmdb3.Movie(movie.id)
+            except tmdb3.TMDBError:
+                raise LookupError('No results for tmdb_id: %s (%s)' % (movie.id, sys.exc_info()[1]))
+            try:
+                movie.update_from_object(result)
+            except tmdb3.TMDBRequestInvalid as e:
+                log.debug('Error updating tmdb info: %s' % e)
+                raise LookupError('Error getting tmdb info')
+        posters = result.posters
+        if posters:
+            # Add any posters we don't already have
+            # TODO: There are quite a few posters per movie, do we need to cache them all?
+            poster_urls = [p.url for p in movie.posters]
+            for item in posters:
+                for size in item.sizes():
+                    url = item.geturl(size)
+                    if url not in poster_urls:
+                        poster_data = {"movie_id":movie.id, "size":size, "url": url, "file": item.filename}
+                        movie.posters.append(TMDBPoster(poster_data))
+        genres = result.genres
+        if genres:
+            for genre in genres:
+                if not genre.id:
+                    continue
+                db_genre = session.query(TMDBGenre).filter(TMDBGenre.id == genre.id).first()
+                if not db_genre:
+                    db_genre = TMDBGenre(genre)
+                if db_genre not in movie.genres:
+                    movie.genres.append(db_genre)
+        movie.updated = datetime.now()
+
+
+def _first_result(results):
+    if results and len(results) >= 1:
+        return results[0]
+
+
+@event('plugin.register')
+def register_plugin():
+    plugin.register(ApiTmdb, 'api_tmdb', api_ver=2)
+>>>>>>> upstream/master

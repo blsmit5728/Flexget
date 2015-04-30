@@ -2,15 +2,13 @@ __author__ = 'deksan'
 
 import logging
 import urllib
-from urlparse import urlparse
 
 import feedparser
 
-from flexget import validator
+from flexget import plugin, validator
 from flexget.entry import Entry
-from flexget.plugin import register_plugin
+from flexget.event import event
 from flexget.plugins.api_tvrage import lookup_series
-from flexget.utils.requests import Session
 
 log = logging.getLogger('newznab')
 
@@ -31,14 +29,17 @@ class Newznab(object):
     Category is any of: movie, tvsearch, music, book
     """
 
-    def validator(self):
-        """Return config validator."""
-        root = validator.factory('dict')
-        root.accept('url', key='url', required=False)
-        root.accept('url', key='website', required=False)
-        root.accept('text', key='apikey', required=False)
-        root.accept('choice', key='category', required=True).accept_choices(['movie', 'tvsearch', 'tv', 'music', 'book'])
-        return root
+    schema = {
+        'type': 'object',
+        'properties': {
+            'category': {'type': 'string', 'enum': ['movie', 'tvsearch', 'tv', 'music', 'book']},
+            'url': {'type': 'string', 'format': 'url'},
+            'website': {'type': 'string', 'format': 'url'},
+            'apikey': {'type': 'string'}
+        },
+        'required': ['category'],
+        'additionalProperties': False
+    }
 
     def build_config(self, config):
         if config['category'] == 'tv':
@@ -70,10 +71,13 @@ class Newznab(object):
             for key in rss_entry.keys():
                 new_entry[key] = rss_entry[key]
             new_entry['url'] = new_entry['link']
+            if rss_entry.enclosures:
+                size = int(rss_entry.enclosures[0]['length'])  # B
+                new_entry['content_size'] = size / 2**20       # MB
             entries.append(new_entry)
         return entries
 
-    def search(self, entry, config=None):
+    def search(self, task, entry, config=None):
         config = self.build_config(config)
         if config['category'] == 'movie':
             return self.do_search_movie(entry, config)
@@ -89,12 +93,14 @@ class Newznab(object):
         # normally this should be used with emit_series who has provided season and episodenumber
         if 'series_name' not in arg_entry or 'series_season' not in arg_entry or 'series_episode' not in arg_entry:
             return []
-        serie_info = lookup_series(arg_entry['series_name'])
-        if not serie_info:
-            return []
+        if 'tvrage_id' not in arg_entry:
+            serie_info = lookup_series(arg_entry['series_name'])
+            if not serie_info:
+                return []
+            arg_entry['tvrage_id'] = serie_info.showid
 
         url = (config['url'] + '&rid=%s&season=%s&ep=%s' %
-               (serie_info.showid, arg_entry['series_season'], arg_entry['series_episode']))
+               (arg_entry['tvrage_id'], arg_entry['series_season'], arg_entry['series_episode']))
         return self.fill_entries_for_url(url, config)
 
     def do_search_movie(self, arg_entry, config=None):
@@ -108,4 +114,7 @@ class Newznab(object):
         url = config['url'] + '&imdbid=' + imdb_id
         return self.fill_entries_for_url(url, config)
 
-register_plugin(Newznab, 'newznab', api_ver=2, groups=['search'])
+
+@event('plugin.register')
+def register_plugin():
+    plugin.register(Newznab, 'newznab', api_ver=2, groups=['search'])

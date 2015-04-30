@@ -2,17 +2,16 @@ from __future__ import unicode_literals, division, absolute_import
 import re
 import logging
 
+from flexget import plugin
+from flexget.event import event
 from flexget.plugins.plugin_urlrewriting import UrlRewritingError
-from flexget.plugin import internet, register_plugin
 from flexget.utils import requests
 from flexget.utils.soup import get_soup
-from flexget import validator
 
 log = logging.getLogger('serienjunkies')
 
 LANGUAGE = ['de', 'en', 'both']
 HOSTER = ['ul', 'cz', 'so']
-
 
 class UrlRewriteSerienjunkies(object):
 
@@ -28,12 +27,14 @@ class UrlRewriteSerienjunkies(object):
     hoster: [ul|cz|so] default "ul"
     """
 
-    def validator(self):
-        root = validator.factory()
-        advanced = root.accept('dict')
-        advanced.accept('choice', key='language').accept_choices(LANGUAGE)
-        advanced.accept('choice', key='hoster').accept_choices(HOSTER)
-        return root
+    schema = {
+        'type': 'object',
+        'properties': {
+            'language': {'type': 'string', 'enum': LANGUAGE, 'default': 'en'},
+            'hoster': {'type': 'string', 'enum': HOSTER, 'default': 'ul'}
+        },
+        'additionalProperties': False
+    }
 
     # urlrewriter API
     def url_rewritable(self, task, entry):
@@ -51,17 +52,18 @@ class UrlRewriteSerienjunkies(object):
         search_title = re.sub('\[.*\] ', '', download_title)
         self.config = task.config.get('serienjunkies')
         download_url = self.parse_download(series_url, search_title, self.config, entry)
+        #Debug Information
         log.debug('TV Show URL: %s' % series_url)
         log.debug('Episode: %s' % search_title)
         log.debug('Download URL: %s' % download_url)
         entry['url'] = download_url
 
-    @internet(log)
+    @plugin.internet(log)
     def parse_download(self, series_url, search_title, config, entry):
         page = requests.get(series_url).content
         try:
             soup = get_soup(page)
-        except Exception, e:
+        except Exception as e:
             raise UrlRewritingError(e)
 
         config = config or {}
@@ -86,10 +88,12 @@ class UrlRewriteSerienjunkies(object):
         # filter language
         if config['language'] in ['de', 'both']:
             if not re.search('german|deutsch', episode_lang, flags=re.IGNORECASE):
-                entry.reject('Language does not match')
-        if config['language'] in ['en', 'both']:
+                entry.reject('Language doesn\'t match selected')
+                return series_url
+        elif config['language'] in ['en', 'both']:
             if not re.search('englisc?h', episode_lang, flags=re.IGNORECASE):
-                entry.reject('Language does not match')
+                entry.reject('Language doesn\'t match selected')
+                return series_url
 
         # find download links
         links = episode.find_all('a')
@@ -106,7 +110,11 @@ class UrlRewriteSerienjunkies(object):
             if re.match(pattern, url):
                 return url
             else:
-                log.debug('Hoster does not match')
+                log.verbose('Hoster doesn\'t match selected')
                 continue
+        
+        raise UrlRewritingError('URL-Rewriting failed, enable verbose logging for details.')
 
-register_plugin(UrlRewriteSerienjunkies, 'serienjunkies', groups=['urlrewriter'])
+@event('plugin.register')
+def register_plugin():
+    plugin.register(UrlRewriteSerienjunkies, 'serienjunkies', groups=['urlrewriter'], api_ver=2)

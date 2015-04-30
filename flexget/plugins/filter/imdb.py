@@ -1,6 +1,8 @@
 from __future__ import unicode_literals, division, absolute_import
 import logging
-from flexget.plugin import register_plugin, get_plugin_by_name, PluginError, priority
+
+from flexget import plugin
+from flexget.event import event
 from flexget.utils.log import log_once
 
 log = logging.getLogger('imdb')
@@ -18,6 +20,11 @@ class FilterImdb(object):
       min_votes: <num>
       min_year: <num>
       max_year: <num>
+
+      # accept movies with any of these genres
+      accept_genres:
+        - genre1
+        - genre2
 
       # reject if genre contains any of these
       reject_genres:
@@ -70,6 +77,7 @@ class FilterImdb(object):
             'max_year': {'type': 'integer'},
             'min_votes': {'type': 'integer'},
             'min_score': {'type': 'number'},
+            'accept_genres': {'type': 'array', 'items': {'type': 'string'}},
             'reject_genres': {'type': 'array', 'items': {'type': 'string'}},
             'reject_languages': {'type': 'array', 'items': {'type': 'string'}},
             'accept_languages': {'type': 'array', 'items': {'type': 'string'}},
@@ -84,10 +92,10 @@ class FilterImdb(object):
     }
 
     # Run later to avoid unnecessary lookups
-    @priority(120)
+    @plugin.priority(120)
     def on_task_filter(self, task, config):
 
-        lookup = get_plugin_by_name('imdb_lookup').instance.lookup
+        lookup = plugin.get_plugin_by_name('imdb_lookup').instance.lookup
 
         # since the plugin does not reject anything, no sense going trough accepted
         for entry in task.undecided:
@@ -96,7 +104,7 @@ class FilterImdb(object):
 
             try:
                 lookup(entry)
-            except PluginError as e:
+            except plugin.PluginError as e:
                 # logs skip message once trough log_once (info) and then only when ran from cmd line (w/o --cron)
                 msg = 'Skipping %s because of an error: %s' % (entry['title'], e.value)
                 if not log_once(msg, logger=log):
@@ -120,6 +128,17 @@ class FilterImdb(object):
             if 'max_year' in config:
                 if entry.get('imdb_year', 0) > config['max_year']:
                     reasons.append('max_year (%s > %s)' % (entry.get('imdb_year'), config['max_year']))
+            
+            if 'accept_genres' in config:
+                accepted = config['accept_genres']
+                accept_genre = False
+                for genre in entry.get('imdb_genres', []):
+                    if genre in accepted:                
+                        accept_genre = True
+                        break
+                if accept_genre == False:
+                    reasons.append('accept_genres')
+
             if 'reject_genres' in config:
                 rejected = config['reject_genres']
                 for genre in entry.get('imdb_genres', []):
@@ -185,10 +204,10 @@ class FilterImdb(object):
             if reasons and not force_accept:
                 msg = 'Didn\'t accept `%s` because of rule(s) %s' % \
                     (entry.get('imdb_name', None) or entry['title'], ', '.join(reasons))
-                if task.manager.options.debug:
+                if task.options.debug:
                     log.debug(msg)
                 else:
-                    if task.manager.options.quiet:
+                    if task.options.cron:
                         log_once(msg, log)
                     else:
                         log.info(msg)
@@ -196,4 +215,6 @@ class FilterImdb(object):
                 log.debug('Accepting %s' % (entry['title']))
                 entry.accept()
 
-register_plugin(FilterImdb, 'imdb', api_ver=2)
+@event('plugin.register')
+def register_plugin():
+    plugin.register(FilterImdb, 'imdb', api_ver=2)
